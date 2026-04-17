@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "notify-telegram-cli"
+version = "0.1.0"
+description = "Telegram notification CLI for local autonomous agents"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "ascorblack" }
+]
+
+[project.scripts]
+notify-telegram-cli = "notify_cli:main"
+
+[tool.setuptools]
+py-modules = ["notify_cli"]
