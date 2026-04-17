@@ -2,48 +2,14 @@
 
 CLI tool for sending Telegram notifications through a bot, designed for autonomous local agents.
 
-## Current Status
+## What It Does
 
-This repository is the source of truth for the `notify` CLI.
-
-Implemented so far:
-
-- plain text notifications
-- `HTML` and `MarkdownV2` parse modes
-- proxy-aware Telegram delivery through local Xray HTTP proxy
-- long text chunking
-- quote-file support for text notifications
-- photo and document delivery with `--photo`, `--file`, and `--attach`
-- explicit Telegram-hosted media delivery with `--photo-id` and `--file-id`
-- explicit text input files with `--message-file` and `--caption-file`
-- JSON input payloads through `--json`
-- machine-readable result output through `--json-output`
-- ordered multi-media delivery in one CLI call
-- photo albums with `--album`
-- media source classification and local upload size guards
-- caption parsing, caption overflow follow-up messages, and stdin caption support
-- fallback-link delivery for oversized uploads and media send failures
-- retry and timeout controls for temporary transport failures
-- unit test coverage for the current behavior
-
-## Repository Layout
-
-- `notify_cli.py` - main CLI implementation
-- `tests/test_notify_cli.py` - unit tests
-
-## Local Usage
-
-The global launcher is expected at:
-
-```bash
-~/.local/bin/notify
-```
-
-It imports the code from this repository directory:
-
-```bash
-/home/dev/notify-telegram-cli
-```
+- sends plain text, `HTML`, and `MarkdownV2` messages
+- sends photos inline with `--photo`
+- sends files as documents with `--file`
+- supports `--attach`, `--photo-id`, `--file-id`, multi-send, and `--album`
+- supports JSON input via `--json` and machine-readable results via `--json-output`
+- routes requests through the local Xray HTTP proxy by default
 
 ## Secrets
 
@@ -65,21 +31,76 @@ export TELEGRAM_PROXY_URL="http://127.0.0.1:10809"
 ~/.config/notify-telegram-cli/config.json
 ```
 
-Use `config.example.json` in this repo as a template.
+Use [config.example.json](config.example.json) as a template.
 
-## Development
+## Install Notify Only
 
-Run the test suite:
-
-```bash
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-Run the CLI directly from the repo:
+If you already cloned the repo locally:
 
 ```bash
-python3 notify_cli.py --help
+./scripts/install-notify.sh
 ```
+
+One-command install from GitHub with `gh`:
+
+```bash
+bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; gh repo clone ascorblack/notify-telegram-cli "$REPO"; fi; "$REPO/scripts/install-notify.sh"'
+```
+
+## Install Notify + Codex Skill
+
+If you already cloned the repo locally:
+
+```bash
+./scripts/install-codex-skill.sh
+```
+
+One-command install from GitHub with `gh`:
+
+```bash
+bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; gh repo clone ascorblack/notify-telegram-cli "$REPO"; fi; "$REPO/scripts/install-codex-skill.sh"'
+```
+
+This installs the skill into:
+
+- `${CODEX_HOME:-~/.codex}/skills/notify-telegram`
+- compatibility copy: `~/.agents/skills/notify-telegram`
+
+## Install Notify + Claude CLI Skill
+
+If you already cloned the repo locally:
+
+```bash
+./scripts/install-claude-skill.sh
+```
+
+One-command install from GitHub with `gh`:
+
+```bash
+bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; gh repo clone ascorblack/notify-telegram-cli "$REPO"; fi; "$REPO/scripts/install-claude-skill.sh"'
+```
+
+This installs the skill into:
+
+- `${CLAUDE_HOME:-~/.claude}/skills/notify-telegram`
+
+## Agent Skill
+
+The agent-facing skill source of truth lives at [SKILL.md](skills/notify-telegram/SKILL.md).
+
+It teaches agents when to notify, when to prefer `--json`, and how to send text, photos, files, albums, and fallback links.
+
+## Mini Prompt
+
+Ready-to-copy bootstrap prompts live in [agent-self-setup.md](prompts/agent-self-setup.md).
+
+Short Codex version:
+
+```text
+Clone or update the private repo `ascorblack/notify-telegram-cli` into `~/.local/share/notify-telegram-cli/repo` using `gh`, run `scripts/install-codex-skill.sh`, verify `command -v notify`, verify the skill exists under the local Codex skill directory, and show me `notify --help`. Do not put secrets into the git repo. If `~/.config/notify-telegram-cli/config.json` already exists, leave it unchanged.
+```
+
+## Local Usage
 
 Examples:
 
@@ -96,21 +117,19 @@ notify --file-id BQACAgIA... --message-file note.txt
 notify --photo screenshot.png --file logs.zip --caption "batch start" "batch body"
 notify --attach artifact.png --tag nightly --tag success
 notify --file huge.tar --fallback-link https://example.com/huge.tar
-notify --file file_id:ABC123... --caption "reuse Telegram-hosted file"
 notify --json '{"message":"dry run","media":[{"type":"photo","source":"./shot.png"}]}' --dry-run --json-output
 ```
 
-## GitHub Prep
+## Development
 
-`gh` is already available and authenticated in the current environment.
-
-Typical next steps:
+Run the test suite:
 
 ```bash
-git init
-git add .
-git commit -m "Initial import of notify telegram cli"
-gh repo create notify-telegram-cli --private --source=. --remote=origin --push
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Switch `--private` to `--public` if needed.
+Run the CLI directly from the repo:
+
+```bash
+python3 notify_cli.py --help
+```

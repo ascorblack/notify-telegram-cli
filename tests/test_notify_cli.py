@@ -1,6 +1,7 @@
 import json
 import io
 import os
+import subprocess
 import sys
 import unittest
 import tempfile
@@ -1571,6 +1572,98 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertIn("/botenv-token/sendMessage", dummy_opener.request.full_url)
         self.assertEqual(dummy_opener.request.data, b'{"chat_id":"999","text":"hello"}')
+
+
+class InstallerAndSkillTests(unittest.TestCase):
+    def setUp(self):
+        self.repo_root = MODULE_DIR
+
+    def run_script(self, script_name, extra_env=None):
+        env = os.environ.copy()
+        temp_home = tempfile.mkdtemp(prefix="notify-installer-home-")
+        env["HOME"] = temp_home
+        if extra_env:
+            env.update(extra_env)
+        script_path = self.repo_root / "scripts" / script_name
+        result = subprocess.run(
+            ["bash", str(script_path)],
+            cwd=self.repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return temp_home, result
+
+    def test_repo_contains_agent_install_assets(self):
+        expected_files = [
+            self.repo_root / "skills" / "notify-telegram" / "SKILL.md",
+            self.repo_root / "scripts" / "install-notify.sh",
+            self.repo_root / "scripts" / "install-codex-skill.sh",
+            self.repo_root / "scripts" / "install-claude-skill.sh",
+            self.repo_root / "prompts" / "agent-self-setup.md",
+        ]
+
+        for path in expected_files:
+            self.assertTrue(path.exists(), f"missing asset: {path}")
+
+    def test_install_notify_script_creates_working_launcher(self):
+        temp_home, result = self.run_script("install-notify.sh")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launcher_path = Path(temp_home) / ".local" / "bin" / "notify"
+        self.assertTrue(launcher_path.exists())
+        self.assertTrue(os.access(launcher_path, os.X_OK))
+
+        help_result = subprocess.run(
+            [str(launcher_path), "--help"],
+            env={**os.environ, "HOME": temp_home},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--json-output", help_result.stdout)
+
+    def test_install_codex_skill_script_copies_skill_to_codex_homes(self):
+        temp_home, result = self.run_script("install-codex-skill.sh")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        primary_skill = Path(temp_home) / ".codex" / "skills" / "notify-telegram" / "SKILL.md"
+        compat_skill = Path(temp_home) / ".agents" / "skills" / "notify-telegram" / "SKILL.md"
+        repo_skill = self.repo_root / "skills" / "notify-telegram" / "SKILL.md"
+
+        self.assertTrue(primary_skill.exists())
+        self.assertTrue(compat_skill.exists())
+        self.assertEqual(primary_skill.read_text(encoding="utf-8"), repo_skill.read_text(encoding="utf-8"))
+        self.assertEqual(compat_skill.read_text(encoding="utf-8"), repo_skill.read_text(encoding="utf-8"))
+
+    def test_install_claude_skill_script_copies_skill(self):
+        temp_home, result = self.run_script("install-claude-skill.sh")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed_skill = Path(temp_home) / ".claude" / "skills" / "notify-telegram" / "SKILL.md"
+        repo_skill = self.repo_root / "skills" / "notify-telegram" / "SKILL.md"
+
+        self.assertTrue(installed_skill.exists())
+        self.assertEqual(installed_skill.read_text(encoding="utf-8"), repo_skill.read_text(encoding="utf-8"))
+
+    def test_installers_are_idempotent(self):
+        temp_home, first = self.run_script("install-codex-skill.sh")
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        second = subprocess.run(
+            ["bash", str(self.repo_root / "scripts" / "install-codex-skill.sh")],
+            cwd=self.repo_root,
+            env={**os.environ, "HOME": temp_home},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertTrue(
+            (Path(temp_home) / ".codex" / "skills" / "notify-telegram" / "SKILL.md").exists()
+        )
 
 
 if __name__ == "__main__":
