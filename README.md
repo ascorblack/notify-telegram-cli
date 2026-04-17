@@ -14,6 +14,8 @@ Implemented so far:
 - long text chunking
 - quote-file support for text notifications
 - photo and document delivery with `--photo`, `--file`, and `--attach`
+- explicit Telegram-hosted media delivery with `--photo-id` and `--file-id`
+- explicit text input files with `--message-file` and `--caption-file`
 - media source classification and local upload size guards
 - caption parsing, caption overflow follow-up messages, and stdin caption support
 - fallback-link delivery for oversized uploads and media send failures
@@ -80,8 +82,11 @@ Examples:
 ```bash
 notify "deploy finished"
 notify --html "<b>Deploy done</b>"
+notify --message-file summary.txt
 notify --photo screenshot.png --caption "UI after fix"
+notify --photo-id AgACAgIA... --caption-file caption.txt
 notify --file logs.zip --title "Incident logs"
+notify --file-id BQACAgIA... --message-file note.txt
 notify --attach artifact.png --tag nightly --tag success
 notify --file huge.tar --fallback-link https://example.com/huge.tar
 notify --file file_id:ABC123... --caption "reuse Telegram-hosted file"

@@ -68,6 +68,25 @@ class NotifyCliTests(unittest.TestCase):
         self.assertTrue(args.json)
         self.assertTrue(args.dry_run)
 
+    def test_parser_accepts_explicit_agent_input_flags(self):
+        args = self.parse(
+            [
+                "--photo-id",
+                "AgACAgIA...",
+                "--message-file",
+                "body.txt",
+                "--caption-file",
+                "caption.txt",
+            ]
+        )
+        self.assertEqual(args.photo_id, "AgACAgIA...")
+        self.assertEqual(args.message_file, "body.txt")
+        self.assertEqual(args.caption_file, "caption.txt")
+
+    def test_caption_flags_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["--caption", "hello", "--caption-file", "caption.txt"])
+
     def test_caption_dash_marks_stdin_caption(self):
         args = self.parse(["--photo", "a.png", "--caption", "-"])
         self.assertEqual(args.caption, "-")
@@ -83,6 +102,43 @@ class NotifyCliTests(unittest.TestCase):
             ),
             "media caption\n",
         )
+
+    def test_resolve_message_reads_message_file(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as message_file:
+            message_file.write("message from file\n")
+            message_path = message_file.name
+
+        try:
+            args = self.parse(["--message-file", message_path])
+            self.assertEqual(
+                self.module.resolve_message(args, io.StringIO(""), stdin_is_tty=True),
+                "message from file\n",
+            )
+        finally:
+            os.unlink(message_path)
+
+    def test_message_file_is_mutually_exclusive_with_inline_message(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["--message-file", "body.txt", "hello"])
+
+    def test_resolve_caption_reads_caption_file(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as caption_file:
+            caption_file.write("caption from file\n")
+            caption_path = caption_file.name
+
+        try:
+            args = self.parse(["--photo", "a.png", "--caption-file", caption_path])
+            self.assertEqual(
+                self.module.resolve_caption(
+                    args,
+                    io.StringIO(""),
+                    stdin_is_tty=True,
+                    message_uses_stdin=False,
+                ),
+                "caption from file\n",
+            )
+        finally:
+            os.unlink(caption_path)
 
     def test_caption_from_stdin_rejects_whitespace_only_input(self):
         args = self.parse(["--photo", "a.png", "--caption", "-", "hello"])
@@ -423,6 +479,10 @@ class NotifyCliTests(unittest.TestCase):
         self.assertIn("--photo", help_text)
         self.assertIn("--file", help_text)
         self.assertIn("--attach", help_text)
+        self.assertIn("--photo-id", help_text)
+        self.assertIn("--file-id", help_text)
+        self.assertIn("--message-file", help_text)
+        self.assertIn("--caption-file", help_text)
         self.assertIn("10 MB", help_text)
         self.assertIn("50 MB", help_text)
         self.assertIn("10809", help_text)
@@ -462,6 +522,23 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(result["method"], "sendPhoto")
         self.assertFalse(result["sent"])
 
+    def test_main_dry_run_reports_send_document_for_file_id_flag(self):
+        stdout = io.StringIO()
+        exit_code = self.module.main(
+            ["--file-id", "AgACAgIA...", "--dry-run", "--json"],
+            stdin=io.StringIO(""),
+            stdout=stdout,
+            stderr=io.StringIO(),
+            stdin_is_tty=True,
+            path_exists=lambda path: False,
+            opener_factory=lambda proxy_url: self.fail("network should not be used"),
+        )
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["method"], "sendDocument")
+        self.assertFalse(result["sent"])
+
     def test_main_allows_media_with_caption_without_message(self):
         stdout = io.StringIO()
         exit_code = self.module.main(
@@ -479,6 +556,92 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(result["method"], "sendPhoto")
         self.assertFalse(result["sent"])
+
+    def test_main_uses_message_file_for_text_delivery(self):
+        class DummyResponse:
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 12}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.request = None
+
+            def open(self, request, timeout=None):
+                self.request = request
+                return DummyResponse()
+
+        dummy_opener = DummyOpener()
+        with tempfile.NamedTemporaryFile("w", delete=False) as message_file:
+            message_file.write("message from file\n")
+            message_path = message_file.name
+
+        try:
+            exit_code = self.module.main(
+                ["--message-file", message_path],
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: dummy_opener,
+            )
+        finally:
+            os.unlink(message_path)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            json.loads(dummy_opener.request.data.decode("utf-8"))["text"],
+            "message from file\n",
+        )
+
+    def test_main_uses_caption_file_for_media_delivery(self):
+        class DummyResponse:
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 13}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                return DummyResponse()
+
+        opener = DummyOpener()
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as photo_file:
+            photo_file.write(b"PNGDATA")
+            photo_path = photo_file.name
+        with tempfile.NamedTemporaryFile("w", delete=False) as caption_file:
+            caption_file.write("caption from file\n")
+            caption_path = caption_file.name
+
+        try:
+            exit_code = self.module.main(
+                ["--photo", photo_path, "--caption-file", caption_path],
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: opener,
+            )
+        finally:
+            os.unlink(photo_path)
+            os.unlink(caption_path)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(opener.requests), 1)
+        self.assertIn("caption from file", opener.requests[0].data.decode("utf-8", errors="replace"))
 
     def test_main_sends_caption_only_media_without_empty_followup(self):
         class DummyResponse:

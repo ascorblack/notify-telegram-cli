@@ -37,6 +37,14 @@ class NotifyError(Exception):
     """Raised when CLI usage or delivery fails."""
 
 
+class NotifyArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        if getattr(parsed, "message_file", None) and getattr(parsed, "message_parts", None):
+            self.error("message_parts are not allowed with --message-file")
+        return parsed
+
+
 def load_local_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, object]:
     if not config_path.exists():
         return {}
@@ -95,6 +103,7 @@ Input modes:
   notify "hello world"
   notify --html "<b>Deploy done</b>"
   printf 'line1\\nline2\\n' | notify -
+  notify --message-file summary.txt
   notify --markdownv2 -
   notify - <<'EOF'
   first line
@@ -103,7 +112,9 @@ Input modes:
 
 Media modes:
   notify --photo screenshot.png --caption "UI after fix"
+  notify --photo-id AgACAgIA... --caption-file caption.txt
   notify --file logs.zip --title "Incident logs"
+  notify --file-id BQACAgIA... --message-file note.txt
   notify --attach artifact.png --tag nightly --tag success
   notify --file huge.tar --fallback-link https://example.com/huge.tar
   notify --file file_id:ABC123... --caption "reuse Telegram-hosted file"
@@ -127,7 +138,7 @@ Environment overrides:
 Local config:
   ~/.config/notify-telegram-cli/config.json
 """
-    parser = argparse.ArgumentParser(
+    parser = NotifyArgumentParser(
         prog="notify",
         description=description,
         epilog=epilog,
@@ -142,7 +153,9 @@ Local config:
     )
     media_group = parser.add_mutually_exclusive_group()
     media_group.add_argument("--photo", metavar="SOURCE", help="send a photo source")
+    media_group.add_argument("--photo-id", metavar="FILE_ID", help="send a Telegram-hosted photo by file_id")
     media_group.add_argument("--file", metavar="SOURCE", help="send a file source")
+    media_group.add_argument("--file-id", metavar="FILE_ID", help="send a Telegram-hosted document by file_id")
     media_group.add_argument("--attach", metavar="SOURCE", help="auto-detect photo vs file")
     parser.add_argument(
         "--disable-web-preview",
@@ -161,13 +174,23 @@ Local config:
     parser.add_argument("--quote", metavar="SOURCE", help="quote text from a local file")
     parser.add_argument("--json", action="store_true", help="print JSON output")
     parser.add_argument("--dry-run", action="store_true", help="print the request without sending")
-    parser.add_argument("--caption", help="media caption text; pass '-' to read from stdin")
+    parser.add_argument("--message-file", metavar="PATH", help="read message body from a local file")
+    caption_group = parser.add_mutually_exclusive_group()
+    caption_group.add_argument("--caption", help="media caption text; pass '-' to read from stdin")
+    caption_group.add_argument("--caption-file", metavar="PATH", help="read media caption from a local file")
     parser.add_argument(
         "message_parts",
         nargs="*",
         help='message text; pass "-" to read the full message from stdin',
     )
     return parser
+
+
+def read_text_file(path: str, label: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise NotifyError(f"unable to read {label}: {exc}") from exc
 
 
 def resolve_message(
@@ -177,7 +200,9 @@ def resolve_message(
     required: bool = True,
     implicit_stdin: bool = True,
 ) -> str:
-    if args.message_parts:
+    if args.message_file:
+        text = read_text_file(args.message_file, "message file")
+    elif args.message_parts:
         if args.message_parts == ["-"]:
             text = stdin.read()
         else:
@@ -202,9 +227,12 @@ def resolve_caption(
     stdin_is_tty: bool,
     message_uses_stdin: bool = False,
 ) -> str | None:
-    caption = args.caption
-    if caption is None:
-        return None
+    if getattr(args, "caption_file", None):
+        caption = read_text_file(args.caption_file, "caption file")
+    else:
+        caption = args.caption
+        if caption is None:
+            return None
     if caption == "-":
         if message_uses_stdin:
             raise NotifyError("caption stdin is ambiguous when message also reads from stdin")
@@ -356,6 +384,20 @@ def normalize_media_source(source: str) -> str:
     if source.startswith(FILE_ID_PREFIX):
         return source[len(FILE_ID_PREFIX) :]
     return source
+
+
+def resolve_media_args(args: argparse.Namespace) -> tuple[str, str] | None:
+    if args.photo:
+        return args.photo, "photo"
+    if getattr(args, "photo_id", None):
+        return f"{FILE_ID_PREFIX}{args.photo_id}", "photo"
+    if args.file:
+        return args.file, "document"
+    if getattr(args, "file_id", None):
+        return f"{FILE_ID_PREFIX}{args.file_id}", "document"
+    if args.attach:
+        return args.attach, classify_media_source(args.attach)
+    return None
 
 
 def ensure_local_media_path_exists(source: str, path_exists) -> None:
@@ -577,9 +619,12 @@ def main(
 
     try:
         args = parser.parse_args(argv)
-        media_source = args.photo or args.file or args.attach
+        media_input = resolve_media_args(args)
+        media_source = media_input[0] if media_input else None
+        media_kind = media_input[1] if media_input else None
         message_uses_stdin = args.message_parts == ["-"] or (
             not args.message_parts
+            and not args.message_file
             and not stdin_is_tty
             and not (media_source and args.caption == "-")
         )
@@ -599,19 +644,12 @@ def main(
         parse_mode = "HTML" if args.html else "MarkdownV2" if args.markdownv2 else None
         quote_text = None
         if args.quote:
-            try:
-                quote_source = Path(args.quote)
-                quote_raw = quote_source.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise NotifyError(f"unable to read quote file: {exc}") from exc
+            quote_raw = read_text_file(args.quote, "quote file")
             if quote_raw:
                 quote_text = format_quote_block(quote_raw.rstrip("\n"), parse_mode)
         text = build_text_body(args, message_text, quote_text)
 
         if media_source:
-            media_kind = "photo" if args.photo else "document"
-            if args.attach:
-                media_kind = classify_media_source(media_source)
             method = "sendPhoto" if media_kind == "photo" else "sendDocument"
             ensure_local_media_path_exists(media_source, path_exists)
 
