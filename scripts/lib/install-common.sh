@@ -2,6 +2,7 @@
 set -euo pipefail
 
 NOTIFY_REPO_SLUG="${NOTIFY_REPO_SLUG:-ascorblack/notify-telegram-cli}"
+NOTIFY_REPO_URL="${NOTIFY_REPO_URL:-https://github.com/${NOTIFY_REPO_SLUG}.git}"
 NOTIFY_INSTALL_REPO_DIR="${NOTIFY_INSTALL_REPO_DIR:-$HOME/.local/share/notify-telegram-cli/repo}"
 NOTIFY_INSTALL_BIN_DIR="${NOTIFY_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 NOTIFY_INSTALL_CONFIG_DIR="${NOTIFY_INSTALL_CONFIG_DIR:-$HOME/.config/notify-telegram-cli}"
@@ -41,7 +42,6 @@ ensure_repo_checkout() {
     return 0
   fi
 
-  require_command gh
   require_command git
 
   mkdir -p "$(dirname "$NOTIFY_INSTALL_REPO_DIR")"
@@ -50,7 +50,7 @@ ensure_repo_checkout() {
   elif [ -e "$NOTIFY_INSTALL_REPO_DIR" ]; then
     fail "install repo dir exists but is not a git checkout: $NOTIFY_INSTALL_REPO_DIR"
   else
-    gh repo clone "$NOTIFY_REPO_SLUG" "$NOTIFY_INSTALL_REPO_DIR" >/dev/null
+    git clone "$NOTIFY_REPO_URL" "$NOTIFY_INSTALL_REPO_DIR" >/dev/null
   fi
 
   if [ ! -f "$NOTIFY_INSTALL_REPO_DIR/notify_cli.py" ]; then

@@ -41,10 +41,10 @@ If you already cloned the repo locally:
 ./scripts/install-notify.sh
 ```
 
-One-command install from GitHub with `gh`:
+One-command install from GitHub with `git`:
 
 ```bash
-bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; gh repo clone ascorblack/notify-telegram-cli "$REPO"; fi; "$REPO/scripts/install-notify.sh"'
+bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; URL="https://github.com/ascorblack/notify-telegram-cli.git"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; git clone "$URL" "$REPO"; fi; "$REPO/scripts/install-notify.sh"'
 ```
 
 ## Install Notify + Codex Skill
@@ -55,10 +55,10 @@ If you already cloned the repo locally:
 ./scripts/install-codex-skill.sh
 ```
 
-One-command install from GitHub with `gh`:
+One-command install from GitHub with `git`:
 
 ```bash
-bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; gh repo clone ascorblack/notify-telegram-cli "$REPO"; fi; "$REPO/scripts/install-codex-skill.sh"'
+bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; URL="https://github.com/ascorblack/notify-telegram-cli.git"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; git clone "$URL" "$REPO"; fi; "$REPO/scripts/install-codex-skill.sh"'
 ```
 
 This installs the skill into:
@@ -74,10 +74,10 @@ If you already cloned the repo locally:
 ./scripts/install-claude-skill.sh
 ```
 
-One-command install from GitHub with `gh`:
+One-command install from GitHub with `git`:
 
 ```bash
-bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; gh repo clone ascorblack/notify-telegram-cli "$REPO"; fi; "$REPO/scripts/install-claude-skill.sh"'
+bash -lc 'set -euo pipefail; REPO="$HOME/.local/share/notify-telegram-cli/repo"; URL="https://github.com/ascorblack/notify-telegram-cli.git"; if [ -d "$REPO/.git" ]; then git -C "$REPO" pull --ff-only; else mkdir -p "$(dirname "$REPO")"; git clone "$URL" "$REPO"; fi; "$REPO/scripts/install-claude-skill.sh"'
 ```
 
 This installs the skill into:
@@ -94,10 +94,12 @@ It teaches agents when to notify, when to prefer `--json`, and how to send text,
 
 Ready-to-copy bootstrap prompts live in [agent-self-setup.md](prompts/agent-self-setup.md).
 
+If the repository stays private, make sure `git clone` already works in your environment via HTTPS credentials or SSH.
+
 Short Codex version:
 
 ```text
-Clone or update the private repo `ascorblack/notify-telegram-cli` into `~/.local/share/notify-telegram-cli/repo` using `gh`, run `scripts/install-codex-skill.sh`, verify `command -v notify`, verify the skill exists under the local Codex skill directory, and show me `notify --help`. Do not put secrets into the git repo. If `~/.config/notify-telegram-cli/config.json` already exists, leave it unchanged.
+Clone or update the private repo `ascorblack/notify-telegram-cli` into `~/.local/share/notify-telegram-cli/repo` using plain `git`, run `scripts/install-codex-skill.sh`, verify `command -v notify`, verify the skill exists under the local Codex skill directory, and show me `notify --help`. Do not put secrets into the git repo. If `~/.config/notify-telegram-cli/config.json` already exists, leave it unchanged.
 ```
 
 ## Local Usage

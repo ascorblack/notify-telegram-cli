@@ -1607,6 +1607,18 @@ class InstallerAndSkillTests(unittest.TestCase):
         for path in expected_files:
             self.assertTrue(path.exists(), f"missing asset: {path}")
 
+    def test_install_docs_and_helpers_prefer_git_over_gh(self):
+        checked_paths = [
+            self.repo_root / "scripts" / "lib" / "install-common.sh",
+            self.repo_root / "README.md",
+            self.repo_root / "prompts" / "agent-self-setup.md",
+        ]
+
+        for path in checked_paths:
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("git", content)
+            self.assertNotIn("gh repo clone", content)
+
     def test_install_notify_script_creates_working_launcher(self):
         temp_home, result = self.run_script("install-notify.sh")
 
