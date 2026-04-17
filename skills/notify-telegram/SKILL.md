@@ -14,6 +14,7 @@ Use `notify` when the user should hear about an important event without reading 
 - A screenshot should be shown inline in Telegram.
 - A report, log bundle, or other file should be attached.
 - The agent wants a predictable machine-friendly interface and should prefer JSON input.
+- The agent wants to self-check install or delivery health before sending updates.
 
 ## Preferred Pattern
 
@@ -23,7 +24,10 @@ For agents, prefer `--json` input and `--json-output`.
 notify --json '{
   "title": "Deploy finished",
   "message": "Production is healthy.",
-  "tag": ["deploy", "success"],
+  "tags": ["deploy", "success"],
+  "links": ["https://example.com/run/123"],
+  "event": {"type": "deploy", "name": "nightly", "status": "success", "id": "run-123"},
+  "meta": {"branch": "main", "services": ["api", "worker"]},
   "media": [
     {"type": "photo", "source": "/tmp/deploy.png"}
   ]
@@ -72,14 +76,21 @@ Fallback when a local file may be too large:
 notify --file /tmp/huge.tar --fallback-link "https://example.com/huge.tar"
 ```
 
+Doctor check:
+
+```bash
+notify --doctor
+notify --doctor --json-output
+```
+
 ## JSON Input Shape
 
 Useful fields:
 
 - `message`
 - `title`
-- `tag`
-- `link`
+- `tag` or `tags`
+- `link` or `links`
 - `quote`
 - `caption`
 - `fallback_link`
@@ -87,6 +98,8 @@ Useful fields:
 - `disable_web_preview`
 - `album`
 - `parse_mode`: `html` or `markdownv2`
+- `event`: string or object
+- `meta`: object with arbitrary context
 - `media`: ordered array of items like `{"type":"photo|photo_id|file|file_id|attach","source":"..."}`
 
 Examples:
@@ -103,3 +116,4 @@ cat payload.json | notify --json -
 - For very large local files, use `--fallback-link`.
 - If a screenshot should render inline, use `--photo`, not `--file`.
 - If the caller needs machine-readable delivery status, add `--json-output`.
+- If the caller is unsure the channel is healthy, run `notify --doctor --json-output` first.

@@ -106,6 +106,11 @@ class NotifyCliTests(unittest.TestCase):
         args = self.parse(["--json", '{"message":"hello"}'])
         self.assertEqual(args.json, '{"message":"hello"}')
 
+    def test_parser_accepts_doctor_flag(self):
+        args = self.parse(["--doctor", "--json-output"])
+        self.assertTrue(args.doctor)
+        self.assertTrue(args.json_output)
+
     def test_caption_flags_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
             self.parse(["--caption", "hello", "--caption-file", "caption.txt"])
@@ -271,6 +276,33 @@ class NotifyCliTests(unittest.TestCase):
             body,
             "Deploy finished\n\nTags: deploy, success\n\nLinks: https://example.com/run/123\n\nBuild passed",
         )
+
+    def test_build_text_body_includes_event_and_meta_blocks(self):
+        args = self.parse(["Build passed"])
+        args.event = {
+            "type": "deploy",
+            "name": "nightly",
+            "status": "success",
+            "phase": "rollout",
+            "id": "run-123",
+            "summary": "All checks passed",
+        }
+        args.meta = {
+            "branch": "main",
+            "commit": "abc123",
+            "services": ["api", "worker"],
+        }
+
+        body = self.module.build_text_body(args, "Build passed", None)
+
+        self.assertIn("Event: deploy / nightly", body)
+        self.assertIn("Status: success", body)
+        self.assertIn("Phase: rollout", body)
+        self.assertIn("ID: run-123", body)
+        self.assertIn("Summary: All checks passed", body)
+        self.assertIn("Meta:", body)
+        self.assertIn("branch: main", body)
+        self.assertIn("services: api, worker", body)
 
     def test_chunk_text_message_preserves_lines(self):
         text = "alpha\nbeta\ngamma"
@@ -655,6 +687,48 @@ class NotifyCliTests(unittest.TestCase):
         payload = json.loads(dummy_opener.request.data.decode("utf-8"))
         self.assertEqual(payload["text"], "Deploy\n\nhello from json")
 
+    def test_main_reads_json_aliases_event_and_meta(self):
+        class DummyResponse:
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 18}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.request = None
+
+            def open(self, request, timeout=None):
+                self.request = request
+                return DummyResponse()
+
+        dummy_opener = DummyOpener()
+        exit_code = self.module.main(
+            [
+                "--json",
+                '{"message":"done","tags":["nightly","success"],"links":["https://example.com/run/123"],'
+                '"event":{"type":"deploy","name":"nightly","status":"success","id":"run-123"},'
+                '"meta":{"branch":"main","services":["api","worker"]}}',
+            ],
+            stdin=io.StringIO(""),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            stdin_is_tty=True,
+            opener_factory=lambda proxy_url: dummy_opener,
+        )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(dummy_opener.request.data.decode("utf-8"))
+        self.assertIn("Tags: nightly, success", payload["text"])
+        self.assertIn("Links: https://example.com/run/123", payload["text"])
+        self.assertIn("Event: deploy / nightly", payload["text"])
+        self.assertIn("ID: run-123", payload["text"])
+        self.assertIn("branch: main", payload["text"])
+
     def test_main_reads_media_from_json_input(self):
         stdout = io.StringIO()
         exit_code = self.module.main(
@@ -672,6 +746,90 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(result["method"], "sendPhoto")
         self.assertFalse(result["sent"])
+
+    def test_main_doctor_reports_ok_json_result(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                if request.full_url.endswith("/getMe"):
+                    return DummyResponse(
+                        b'{"ok": true, "result": {"id": 1, "is_bot": true, "username": "notify_bot"}}'
+                    )
+                if request.full_url.endswith("/getChat"):
+                    return DummyResponse(
+                        b'{"ok": true, "result": {"id": 999, "type": "private"}}'
+                    )
+                raise AssertionError(f"unexpected request url: {request.full_url}")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        old_env = os.environ.copy()
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            os.environ["TELEGRAM_PROXY_URL"] = "http://127.0.0.1:19090"
+            exit_code = self.module.main(
+                ["--doctor", "--json-output"],
+                stdin=io.StringIO(""),
+                stdout=stdout,
+                stderr=stderr,
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: DummyOpener(),
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["command"], "doctor")
+        self.assertIn("checks", result)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_main_doctor_fails_when_token_missing(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        old_env = os.environ.copy()
+        temp_home = tempfile.mkdtemp(prefix="notify-doctor-home-")
+        try:
+            os.environ["HOME"] = temp_home
+            os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            os.environ.pop("TELEGRAM_CHAT_ID", None)
+            os.environ.pop("TELEGRAM_PROXY_URL", None)
+            exit_code = self.module.main(
+                ["--doctor", "--json-output"],
+                stdin=io.StringIO(""),
+                stdout=stdout,
+                stderr=stderr,
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: self.fail("network should not be used"),
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["command"], "doctor")
+        self.assertIn("token", stderr.getvalue().lower())
 
     def test_main_rejects_json_input_with_inline_message(self):
         stderr = io.StringIO()

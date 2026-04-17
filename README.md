@@ -9,6 +9,8 @@ CLI tool for sending Telegram notifications through a bot, designed for autonomo
 - sends files as documents with `--file`
 - supports `--attach`, `--photo-id`, `--file-id`, multi-send, and `--album`
 - supports JSON input via `--json` and machine-readable results via `--json-output`
+- supports richer agent JSON with `tags`, `links`, `event`, and `meta`
+- supports `notify --doctor` for config, install, proxy, and Telegram API checks
 - routes requests through the local Xray HTTP proxy by default
 
 ## Secrets
@@ -99,7 +101,7 @@ If the repository stays private, make sure `git clone` already works in your env
 Short Codex version:
 
 ```text
-Clone or update the private repo `ascorblack/notify-telegram-cli` into `~/.local/share/notify-telegram-cli/repo` using plain `git`, run `scripts/install-codex-skill.sh`, verify `command -v notify`, verify the skill exists under the local Codex skill directory, and show me `notify --help`. Do not put secrets into the git repo. If `~/.config/notify-telegram-cli/config.json` already exists, leave it unchanged.
+Clone or update the private repo `ascorblack/notify-telegram-cli` into `~/.local/share/notify-telegram-cli/repo` using plain `git`, run `scripts/install-codex-skill.sh`, verify `command -v notify`, verify the skill exists under the local Codex skill directory, run `notify --doctor --json-output`, and show me `notify --help`. Do not put secrets into the git repo. If `~/.config/notify-telegram-cli/config.json` already exists, leave it unchanged.
 ```
 
 ## Local Usage
@@ -110,6 +112,7 @@ Examples:
 notify "deploy finished"
 notify --html "<b>Deploy done</b>"
 notify --json '{"title":"Deploy","message":"done"}'
+notify --json '{"message":"done","tags":["nightly","success"],"links":["https://example.com/run/123"],"event":{"type":"deploy","name":"nightly","status":"success","id":"run-123"},"meta":{"branch":"main","services":["api","worker"]}}'
 notify --message-file summary.txt
 notify --photo screenshot.png --caption "UI after fix"
 notify --photo-id AgACAgIA... --caption-file caption.txt
@@ -120,7 +123,40 @@ notify --photo screenshot.png --file logs.zip --caption "batch start" "batch bod
 notify --attach artifact.png --tag nightly --tag success
 notify --file huge.tar --fallback-link https://example.com/huge.tar
 notify --json '{"message":"dry run","media":[{"type":"photo","source":"./shot.png"}]}' --dry-run --json-output
+notify --doctor
+notify --doctor --json-output
 ```
+
+## JSON Schema
+
+Agent-friendly JSON fields:
+
+- `message`
+- `title`
+- `tag` or `tags`
+- `link` or `links`
+- `quote`
+- `caption`
+- `fallback_link`
+- `silent`
+- `disable_web_preview`
+- `album`
+- `parse_mode`: `html` or `markdownv2`
+- `event`: string or object, for example `{"type":"deploy","name":"nightly","status":"success","id":"run-123"}`
+- `meta`: object with arbitrary context, for example `{"branch":"main","services":["api","worker"]}`
+- `media`: ordered array of items like `{"type":"photo|photo_id|file|file_id|attach","source":"..."}`
+
+`event` and `meta` are rendered into the outgoing Telegram text so autonomous agents can send richer structured context without hand-formatting prose.
+
+## Doctor
+
+`notify --doctor` checks:
+
+- local config presence and parseability
+- token/chat/proxy source resolution
+- whether `notify` is on `PATH`
+- Codex/Claude skill installation paths
+- Telegram `getMe` and `getChat` reachability through the configured proxy
 
 ## Development
 

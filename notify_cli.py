@@ -8,6 +8,7 @@ import html as html_module
 import mimetypes
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 import uuid
@@ -17,7 +18,6 @@ from urllib.parse import urlparse
 
 
 DEFAULT_PROXY_URL = "http://127.0.0.1:10809"
-DEFAULT_CONFIG_PATH = Path.home() / ".config" / "notify-telegram-cli" / "config.json"
 DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_RETRY_COUNT = 2
 FILE_ID_PREFIX = "file_id:"
@@ -58,7 +58,13 @@ class NotifyArgumentParser(argparse.ArgumentParser):
 RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
-def load_local_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, object]:
+def get_default_config_path() -> Path:
+    return Path.home() / ".config" / "notify-telegram-cli" / "config.json"
+
+
+def load_local_config(config_path: Path | None = None) -> dict[str, object]:
+    if config_path is None:
+        config_path = get_default_config_path()
     if not config_path.exists():
         return {}
     try:
@@ -69,7 +75,7 @@ def load_local_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, obje
         raise NotifyError(f"local config is not valid JSON: {exc}") from exc
 
 
-def resolve_runtime_settings(config_path: Path = DEFAULT_CONFIG_PATH) -> tuple[str, str, str]:
+def resolve_runtime_settings(config_path: Path | None = None) -> tuple[str, str, str]:
     config = load_local_config(config_path)
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or str(config.get("bot_token") or "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID") or str(config.get("chat_id") or "")
@@ -116,10 +122,12 @@ Input modes:
   notify "hello world"
   notify --html "<b>Deploy done</b>"
   notify --json '{"message":"hello from agent","title":"Deploy"}'
+  notify --json '{"tags":["nightly"],"event":{"type":"deploy","status":"success"}}'
   cat payload.json | notify --json -
   printf 'line1\\nline2\\n' | notify -
   notify --message-file summary.txt
   notify --markdownv2 -
+  notify --doctor --json-output
   notify - <<'EOF'
   first line
   second line
@@ -168,6 +176,7 @@ Local config:
         help="send message with Telegram MarkdownV2 formatting",
     )
     parser.set_defaults(media_items=[])
+    parser.set_defaults(event=None, meta=None)
     parser.add_argument("--photo", metavar="SOURCE", action=MediaItemAction, help="send a photo source")
     parser.add_argument(
         "--photo-id",
@@ -201,6 +210,7 @@ Local config:
     parser.add_argument("--quote", metavar="SOURCE", help="quote text from a local file")
     parser.add_argument("--json", metavar="SOURCE", help="read full notification spec from JSON, '-' for stdin, '@path' for file")
     parser.add_argument("--json-output", action="store_true", help="print machine-readable JSON result")
+    parser.add_argument("--doctor", action="store_true", help="run self-checks for config, proxy, Telegram API, and installed skills")
     parser.add_argument("--dry-run", action="store_true", help="print the request without sending")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRY_COUNT, help="retry count for temporary network/API failures")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="request timeout in seconds")
@@ -239,22 +249,74 @@ def load_json_input(source: str, stdin) -> dict[str, object]:
     return payload
 
 
+def normalize_string_list(value: object, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    raise NotifyError(f"json input field '{field_name}' must be a string or list")
+
+
+def normalize_event_payload(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {"name": value}
+    if not isinstance(value, dict):
+        raise NotifyError("json input field 'event' must be a string or object")
+    normalized: dict[str, object] = {}
+    for key, raw_value in value.items():
+        if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
+            normalized[str(key)] = raw_value
+        elif isinstance(raw_value, list):
+            normalized[str(key)] = [str(item) for item in raw_value]
+        else:
+            normalized[str(key)] = json.dumps(raw_value, ensure_ascii=False, sort_keys=True)
+    return normalized
+
+
+def normalize_meta_payload(value: object) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise NotifyError("json input field 'meta' must be an object")
+    normalized: dict[str, object] = {}
+    for key, raw_value in value.items():
+        if isinstance(raw_value, list):
+            normalized[str(key)] = [str(item) for item in raw_value]
+        elif isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
+            normalized[str(key)] = raw_value
+        else:
+            normalized[str(key)] = json.dumps(raw_value, ensure_ascii=False, sort_keys=True)
+    return normalized
+
+
 def apply_json_input(args: argparse.Namespace, payload: dict[str, object]) -> argparse.Namespace:
     if "message" in payload and "message_parts" not in payload:
         message = payload["message"]
         args.message_parts = [message] if isinstance(message, str) else []
     if "title" in payload and isinstance(payload["title"], str):
         args.title = payload["title"]
-    if "tag" in payload and isinstance(payload["tag"], list):
-        args.tag = [str(item) for item in payload["tag"]]
-    if "link" in payload and isinstance(payload["link"], list):
-        args.link = [str(item) for item in payload["link"]]
+    tags = normalize_string_list(payload.get("tag"), "tag")
+    tags.extend(normalize_string_list(payload.get("tags"), "tags"))
+    if tags:
+        args.tag = tags
+    links = normalize_string_list(payload.get("link"), "link")
+    links.extend(normalize_string_list(payload.get("links"), "links"))
+    if links:
+        args.link = links
     if "quote" in payload and isinstance(payload["quote"], str):
         args.quote = payload["quote"]
     if "caption" in payload and isinstance(payload["caption"], str):
         args.caption = payload["caption"]
     if "fallback_link" in payload and isinstance(payload["fallback_link"], str):
         args.fallback_link = payload["fallback_link"]
+    if "event" in payload:
+        args.event = normalize_event_payload(payload["event"])
+    if "meta" in payload:
+        args.meta = normalize_meta_payload(payload["meta"])
     if "silent" in payload:
         args.silent = bool(payload["silent"])
     if "disable_web_preview" in payload:
@@ -343,6 +405,51 @@ def resolve_message(
     return text
 
 
+def format_metadata_value(value: object) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def build_event_block(event: dict[str, object] | None) -> str | None:
+    if not event:
+        return None
+    lines: list[str] = []
+    event_type = format_metadata_value(event["type"]) if "type" in event else ""
+    event_name = format_metadata_value(event["name"]) if "name" in event else ""
+    if event_type and event_name:
+        lines.append(f"Event: {event_type} / {event_name}")
+    elif event_name:
+        lines.append(f"Event: {event_name}")
+    elif event_type:
+        lines.append(f"Event: {event_type}")
+    field_labels = {
+        "status": "Status",
+        "phase": "Phase",
+        "id": "ID",
+        "summary": "Summary",
+    }
+    for key in ("status", "phase", "id", "summary"):
+        if key in event and event[key] not in (None, ""):
+            lines.append(f"{field_labels[key]}: {format_metadata_value(event[key])}")
+    for key in event:
+        if key in {"type", "name", "status", "phase", "id", "summary"}:
+            continue
+        lines.append(f"{key}: {format_metadata_value(event[key])}")
+    return "\n".join(lines) if lines else None
+
+
+def build_meta_block(meta: dict[str, object] | None) -> str | None:
+    if not meta:
+        return None
+    lines = ["Meta:"]
+    for key, value in meta.items():
+        lines.append(f"{key}: {format_metadata_value(value)}")
+    return "\n".join(lines)
+
+
 def resolve_caption(
     args: argparse.Namespace,
     stdin,
@@ -368,10 +475,16 @@ def build_text_body(args: argparse.Namespace, message_text: str, quote_text: str
     parts = []
     if args.title:
         parts.append(args.title)
+    event_text = build_event_block(getattr(args, "event", None))
+    if event_text:
+        parts.append(event_text)
     if args.tag:
         parts.append(f"Tags: {', '.join(args.tag)}")
     if args.link:
         parts.append(f"Links: {' '.join(args.link)}")
+    meta_text = build_meta_block(getattr(args, "meta", None))
+    if meta_text:
+        parts.append(meta_text)
     if quote_text:
         parts.append(quote_text)
     parts.append(message_text)
@@ -583,6 +696,29 @@ def build_json_request(token: str, method: str, payload: dict[str, object]) -> u
     )
 
 
+def call_telegram_json_method(
+    token: str,
+    method: str,
+    payload: dict[str, object],
+    opener,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRY_COUNT,
+):
+    request = build_json_request(token, method, payload)
+    with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
+        raw_body = response.read()
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
+
+    if not body.get("ok"):
+        description = body.get("description", "unknown Telegram API error")
+        raise NotifyError(f"Telegram API error: {description}")
+    return body
+
+
 def is_retryable_http_error(exc: urllib.error.HTTPError) -> bool:
     return exc.code in RETRYABLE_HTTP_STATUS_CODES
 
@@ -661,19 +797,14 @@ def send_message(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int = DEFAULT_RETRY_COUNT,
 ):
-    request = build_json_request(token, "sendMessage", payload)
-    with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
-        raw_body = response.read()
-
-    try:
-        body = json.loads(raw_body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
-
-    if not body.get("ok"):
-        description = body.get("description", "unknown Telegram API error")
-        raise NotifyError(f"Telegram API error: {description}")
-    return body
+    return call_telegram_json_method(
+        token,
+        "sendMessage",
+        payload,
+        opener,
+        timeout=timeout,
+        retries=retries,
+    )
 
 
 def emit_result(stdout, as_json: bool, payload: dict[str, object]) -> None:
@@ -808,6 +939,191 @@ def send_media_group(
     return body
 
 
+def inspect_runtime_settings(config_path: Path | None = None) -> dict[str, object]:
+    if config_path is None:
+        config_path = get_default_config_path()
+    result: dict[str, object] = {
+        "config_path": str(config_path),
+        "config_exists": config_path.exists(),
+        "config_error": None,
+        "token": "",
+        "token_source": None,
+        "chat_id": "",
+        "chat_id_source": None,
+        "proxy_url": DEFAULT_PROXY_URL,
+        "proxy_source": "default",
+    }
+    try:
+        config = load_local_config(config_path)
+    except NotifyError as exc:
+        result["config_error"] = str(exc)
+        config = {}
+
+    env_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    env_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    env_proxy = os.environ.get("TELEGRAM_PROXY_URL")
+    config_token = str(config.get("bot_token") or "")
+    config_chat_id = str(config.get("chat_id") or "")
+    config_proxy = str(config.get("proxy_url") or "")
+
+    if env_token:
+        result["token"] = env_token
+        result["token_source"] = "env"
+    elif config_token:
+        result["token"] = config_token
+        result["token_source"] = "config"
+
+    if env_chat_id:
+        result["chat_id"] = env_chat_id
+        result["chat_id_source"] = "env"
+    elif config_chat_id:
+        result["chat_id"] = config_chat_id
+        result["chat_id_source"] = "config"
+
+    if env_proxy:
+        result["proxy_url"] = env_proxy
+        result["proxy_source"] = "env"
+    elif config_proxy:
+        result["proxy_url"] = config_proxy
+        result["proxy_source"] = "config"
+
+    return result
+
+
+def format_check_line(status: str, name: str, message: str) -> str:
+    return f"[{status}] {name}: {message}"
+
+
+def run_doctor(
+    stdout,
+    stderr,
+    as_json: bool,
+    opener_factory,
+    timeout: int,
+    retries: int,
+) -> int:
+    checks: list[dict[str, object]] = []
+    runtime = inspect_runtime_settings()
+
+    def add_check(name: str, status: str, message: str) -> None:
+        checks.append({"name": name, "status": status, "message": message})
+
+    if runtime["config_error"]:
+        add_check("config", "fail", str(runtime["config_error"]))
+    elif runtime["config_exists"]:
+        add_check("config", "ok", f"loaded {runtime['config_path']}")
+    else:
+        add_check("config", "warn", f"not found at {runtime['config_path']}")
+
+    if runtime["token"]:
+        add_check("token", "ok", f"configured via {runtime['token_source']}")
+    else:
+        add_check("token", "fail", "missing TELEGRAM_BOT_TOKEN or config bot_token")
+
+    if runtime["chat_id"]:
+        add_check("chat_id", "ok", f"configured via {runtime['chat_id_source']}")
+    else:
+        add_check("chat_id", "fail", "missing TELEGRAM_CHAT_ID or config chat_id")
+
+    add_check("proxy", "ok", f"{runtime['proxy_url']} via {runtime['proxy_source']}")
+
+    launcher_path = shutil.which("notify")
+    if launcher_path:
+        add_check("launcher", "ok", launcher_path)
+    else:
+        add_check("launcher", "warn", "notify not found in PATH")
+
+    skill_paths = {
+        "codex_skill": Path.home() / ".codex" / "skills" / "notify-telegram" / "SKILL.md",
+        "agents_skill": Path.home() / ".agents" / "skills" / "notify-telegram" / "SKILL.md",
+        "claude_skill": Path.home() / ".claude" / "skills" / "notify-telegram" / "SKILL.md",
+    }
+    for name, path in skill_paths.items():
+        if path.exists():
+            add_check(name, "ok", str(path))
+        else:
+            add_check(name, "warn", f"not found at {path}")
+
+    token = str(runtime["token"])
+    chat_id = str(runtime["chat_id"])
+    if token and chat_id:
+        try:
+            opener = opener_factory(str(runtime["proxy_url"]))
+            get_me = call_telegram_json_method(
+                token,
+                "getMe",
+                {},
+                opener,
+                timeout=timeout,
+                retries=retries,
+            )
+            bot_username = get_me.get("result", {}).get("username", "<unknown>")
+            add_check("telegram_getMe", "ok", f"reachable as @{bot_username}")
+
+            get_chat = call_telegram_json_method(
+                token,
+                "getChat",
+                {"chat_id": chat_id},
+                opener,
+                timeout=timeout,
+                retries=retries,
+            )
+            chat_type = get_chat.get("result", {}).get("type", "<unknown>")
+            add_check("telegram_getChat", "ok", f"chat {chat_id} reachable ({chat_type})")
+        except (NotifyError, urllib.error.HTTPError, urllib.error.URLError) as exc:
+            add_check("telegram", "fail", str(exc))
+
+    failed = any(check["status"] == "fail" for check in checks)
+    result = {
+        "ok": not failed,
+        "command": "doctor",
+        "checks": checks,
+        "runtime": {
+            "config_path": runtime["config_path"],
+            "config_exists": runtime["config_exists"],
+            "token_source": runtime["token_source"],
+            "chat_id_source": runtime["chat_id_source"],
+            "proxy_source": runtime["proxy_source"],
+            "proxy_url": runtime["proxy_url"],
+        },
+    }
+
+    if as_json:
+        stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    else:
+        for check in checks:
+            stdout.write(format_check_line(check["status"], check["name"], check["message"]) + "\n")
+
+    for check in checks:
+        if check["status"] == "fail":
+            stderr.write(format_check_line(check["status"], check["name"], check["message"]) + "\n")
+
+    return 1 if failed else 0
+
+
+def validate_doctor_args(args: argparse.Namespace) -> None:
+    if not args.doctor:
+        return
+    if args.json:
+        raise NotifyError("--doctor cannot be combined with --json")
+    if args.message_parts:
+        raise NotifyError("--doctor cannot be combined with message text")
+    if args.message_file:
+        raise NotifyError("--doctor cannot be combined with --message-file")
+    if args.caption or args.caption_file:
+        raise NotifyError("--doctor cannot be combined with caption flags")
+    if args.media_items:
+        raise NotifyError("--doctor cannot be combined with media flags")
+    if args.title or args.tag or args.link:
+        raise NotifyError("--doctor cannot be combined with title, tag, or link flags")
+    if args.fallback_link or args.quote:
+        raise NotifyError("--doctor cannot be combined with fallback or quote flags")
+    if args.html or args.markdownv2 or args.album or args.silent or args.disable_web_preview:
+        raise NotifyError("--doctor cannot be combined with formatting or delivery flags")
+    if args.dry_run:
+        raise NotifyError("--doctor cannot be combined with --dry-run")
+
+
 def main(
     argv=None,
     stdin=None,
@@ -835,6 +1151,16 @@ def main(
 
     try:
         args = parser.parse_args(argv)
+        validate_doctor_args(args)
+        if args.doctor:
+            return run_doctor(
+                stdout,
+                stderr,
+                args.json_output,
+                opener_factory=opener_factory,
+                timeout=args.timeout,
+                retries=args.retries,
+            )
         validate_json_input_compatibility(args)
         if args.json:
             args = apply_json_input(args, load_json_input(args.json, stdin))
