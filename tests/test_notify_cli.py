@@ -40,9 +40,21 @@ class NotifyCliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.parse(["--html", "--markdownv2", "hello"])
 
-    def test_media_flags_are_mutually_exclusive(self):
-        with self.assertRaises(SystemExit):
-            self.parse(["--photo", "a.png", "--file", "b.zip"])
+    def test_parser_preserves_ordered_media_items(self):
+        args = self.parse(
+            [
+                "--photo",
+                "a.png",
+                "--file",
+                "b.zip",
+                "--photo-id",
+                "AgACAgIA...",
+            ]
+        )
+        self.assertEqual(
+            args.media_items,
+            [("photo", "a.png"), ("file", "b.zip"), ("photo_id", "AgACAgIA...")],
+        )
 
     def test_parser_accepts_agent_facing_flags(self):
         args = self.parse(
@@ -479,6 +491,7 @@ class NotifyCliTests(unittest.TestCase):
         self.assertIn("--photo", help_text)
         self.assertIn("--file", help_text)
         self.assertIn("--attach", help_text)
+        self.assertIn("--album", help_text)
         self.assertIn("--photo-id", help_text)
         self.assertIn("--file-id", help_text)
         self.assertIn("--message-file", help_text)
@@ -538,6 +551,266 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(result["method"], "sendDocument")
         self.assertFalse(result["sent"])
+
+    def test_main_dry_run_reports_media_group_for_album(self):
+        stdout = io.StringIO()
+        exit_code = self.module.main(
+            [
+                "--album",
+                "--photo",
+                "/tmp/one.png",
+                "--photo-id",
+                "AgACAgIAAlbum",
+                "--dry-run",
+                "--json",
+                "album body",
+            ],
+            stdin=io.StringIO(""),
+            stdout=stdout,
+            stderr=io.StringIO(),
+            stdin_is_tty=True,
+            path_exists=lambda path: path == "/tmp/one.png",
+            stat_fn=lambda path: type("DummyStat", (), {"st_size": 1024})(),
+            opener_factory=lambda proxy_url: self.fail("network should not be used"),
+        )
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["method"], "sendMediaGroup")
+        self.assertFalse(result["sent"])
+
+    def test_main_rejects_album_with_document_media(self):
+        stderr = io.StringIO()
+        exit_code = self.module.main(
+            ["--album", "--photo", "one.png", "--file", "two.zip", "album body"],
+            stdin=io.StringIO(""),
+            stdout=io.StringIO(),
+            stderr=stderr,
+            stdin_is_tty=True,
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("album", stderr.getvalue().lower())
+
+    def test_main_sends_multiple_media_sequentially_in_order(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                return DummyResponse(b'{"ok": true, "result": {"message_id": 21}}')
+
+        opener = DummyOpener()
+        old_env = os.environ.copy()
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as photo_file:
+            photo_file.write(b"PNGDATA")
+            photo_path = photo_file.name
+        with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as doc_file:
+            doc_file.write(b"DOCDATA")
+            doc_path = doc_file.name
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            os.environ["TELEGRAM_PROXY_URL"] = "http://127.0.0.1:19090"
+            exit_code = self.module.main(
+                [
+                    "--photo",
+                    photo_path,
+                    "--file",
+                    doc_path,
+                    "--caption",
+                    "batch caption",
+                    "batch body",
+                ],
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: opener,
+            )
+        finally:
+            os.unlink(photo_path)
+            os.unlink(doc_path)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(opener.requests), 3)
+        self.assertIn("/botenv-token/sendPhoto", opener.requests[0].full_url)
+        self.assertIn("/botenv-token/sendDocument", opener.requests[1].full_url)
+        self.assertIn("/botenv-token/sendMessage", opener.requests[2].full_url)
+
+    def test_main_does_not_send_fallback_after_partial_multi_send_failure(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+                self.responses = [
+                    DummyResponse(b'{"ok": true, "result": {"message_id": 30}}'),
+                    DummyResponse(b'{"ok": false, "description": "Bad Request: failed to send"}'),
+                ]
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                return self.responses.pop(0)
+
+        opener = DummyOpener()
+        stderr = io.StringIO()
+        old_env = os.environ.copy()
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as photo_file:
+            photo_file.write(b"PNGDATA")
+            photo_path = photo_file.name
+        with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as doc_file:
+            doc_file.write(b"DOCDATA")
+            doc_path = doc_file.name
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            os.environ["TELEGRAM_PROXY_URL"] = "http://127.0.0.1:19090"
+            exit_code = self.module.main(
+                [
+                    "--photo",
+                    photo_path,
+                    "--file",
+                    doc_path,
+                    "--fallback-link",
+                    "https://example.com/fallback",
+                    "--caption",
+                    "batch caption",
+                    "batch body",
+                ],
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+                stderr=stderr,
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: opener,
+            )
+        finally:
+            os.unlink(photo_path)
+            os.unlink(doc_path)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIn("/botenv-token/sendPhoto", opener.requests[0].full_url)
+        self.assertIn("/botenv-token/sendDocument", opener.requests[1].full_url)
+        self.assertNotIn("fallback", stderr.getvalue().lower())
+
+    def test_main_sends_fallback_when_first_multi_send_item_fails(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+                self.responses = [
+                    DummyResponse(b'{"ok": false, "description": "Bad Request: failed to send"}'),
+                    DummyResponse(b'{"ok": true, "result": {"message_id": 31}}'),
+                ]
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                return self.responses.pop(0)
+
+        opener = DummyOpener()
+        old_env = os.environ.copy()
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as photo_file:
+            photo_file.write(b"PNGDATA")
+            photo_path = photo_file.name
+        with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as doc_file:
+            doc_file.write(b"DOCDATA")
+            doc_path = doc_file.name
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            os.environ["TELEGRAM_PROXY_URL"] = "http://127.0.0.1:19090"
+            exit_code = self.module.main(
+                [
+                    "--photo",
+                    photo_path,
+                    "--file",
+                    doc_path,
+                    "--fallback-link",
+                    "https://example.com/fallback",
+                    "--caption",
+                    "batch caption",
+                    "batch body",
+                ],
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: opener,
+            )
+        finally:
+            os.unlink(photo_path)
+            os.unlink(doc_path)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIn("/botenv-token/sendPhoto", opener.requests[0].full_url)
+        self.assertIn("/botenv-token/sendMessage", opener.requests[1].full_url)
+        self.assertIn("https://example.com/fallback", opener.requests[1].data.decode("utf-8"))
+
+    def test_main_rejects_album_over_ten_items(self):
+        stderr = io.StringIO()
+        argv = ["--album"]
+        for index in range(11):
+            argv.extend(["--photo", f"/tmp/photo-{index}.png"])
+        argv.append("album body")
+
+        exit_code = self.module.main(
+            argv,
+            stdin=io.StringIO(""),
+            stdout=io.StringIO(),
+            stderr=stderr,
+            stdin_is_tty=True,
+            path_exists=lambda path: True,
+            stat_fn=lambda path: type("DummyStat", (), {"st_size": 1024})(),
+            opener_factory=lambda proxy_url: self.fail("network should not be used"),
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("10", stderr.getvalue())
 
     def test_main_allows_media_with_caption_without_message(self):
         stdout = io.StringIO()

@@ -24,6 +24,7 @@ PHOTO_MAX_BYTES = 10 * 1024 * 1024
 DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_MEDIA_GROUP_LIMIT = 10
 HTML_QUOTE_OPEN = "<pre><code>"
 HTML_QUOTE_CLOSE = "</code></pre>"
 PHOTO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
@@ -35,6 +36,14 @@ MEDIA_SIZE_LIMITS = {
 
 class NotifyError(Exception):
     """Raised when CLI usage or delivery fails."""
+
+
+class MediaItemAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        media_items = list(getattr(namespace, "media_items", []) or [])
+        media_items.append((self.dest, values))
+        setattr(namespace, "media_items", media_items)
+        setattr(namespace, self.dest, values)
 
 
 class NotifyArgumentParser(argparse.ArgumentParser):
@@ -113,6 +122,7 @@ Input modes:
 Media modes:
   notify --photo screenshot.png --caption "UI after fix"
   notify --photo-id AgACAgIA... --caption-file caption.txt
+  notify --album --photo shot-1.png --photo shot-2.png
   notify --file logs.zip --title "Incident logs"
   notify --file-id BQACAgIA... --message-file note.txt
   notify --attach artifact.png --tag nightly --tag success
@@ -151,12 +161,23 @@ Local config:
         action="store_true",
         help="send message with Telegram MarkdownV2 formatting",
     )
-    media_group = parser.add_mutually_exclusive_group()
-    media_group.add_argument("--photo", metavar="SOURCE", help="send a photo source")
-    media_group.add_argument("--photo-id", metavar="FILE_ID", help="send a Telegram-hosted photo by file_id")
-    media_group.add_argument("--file", metavar="SOURCE", help="send a file source")
-    media_group.add_argument("--file-id", metavar="FILE_ID", help="send a Telegram-hosted document by file_id")
-    media_group.add_argument("--attach", metavar="SOURCE", help="auto-detect photo vs file")
+    parser.set_defaults(media_items=[])
+    parser.add_argument("--photo", metavar="SOURCE", action=MediaItemAction, help="send a photo source")
+    parser.add_argument(
+        "--photo-id",
+        metavar="FILE_ID",
+        action=MediaItemAction,
+        help="send a Telegram-hosted photo by file_id",
+    )
+    parser.add_argument("--file", metavar="SOURCE", action=MediaItemAction, help="send a file source")
+    parser.add_argument(
+        "--file-id",
+        metavar="FILE_ID",
+        action=MediaItemAction,
+        help="send a Telegram-hosted document by file_id",
+    )
+    parser.add_argument("--attach", metavar="SOURCE", action=MediaItemAction, help="auto-detect photo vs file")
+    parser.add_argument("--album", action="store_true", help="send multiple photos as one Telegram album")
     parser.add_argument(
         "--disable-web-preview",
         action="store_true",
@@ -386,18 +407,22 @@ def normalize_media_source(source: str) -> str:
     return source
 
 
-def resolve_media_args(args: argparse.Namespace) -> tuple[str, str] | None:
-    if args.photo:
-        return args.photo, "photo"
-    if getattr(args, "photo_id", None):
-        return f"{FILE_ID_PREFIX}{args.photo_id}", "photo"
-    if args.file:
-        return args.file, "document"
-    if getattr(args, "file_id", None):
-        return f"{FILE_ID_PREFIX}{args.file_id}", "document"
-    if args.attach:
-        return args.attach, classify_media_source(args.attach)
-    return None
+def resolve_media_inputs(args: argparse.Namespace) -> list[dict[str, str]]:
+    media_inputs: list[dict[str, str]] = []
+    for kind, value in getattr(args, "media_items", []) or []:
+        if kind == "photo":
+            media_inputs.append({"source": value, "media_kind": "photo"})
+        elif kind == "photo_id":
+            media_inputs.append({"source": f"{FILE_ID_PREFIX}{value}", "media_kind": "photo"})
+        elif kind == "file":
+            media_inputs.append({"source": value, "media_kind": "document"})
+        elif kind == "file_id":
+            media_inputs.append({"source": f"{FILE_ID_PREFIX}{value}", "media_kind": "document"})
+        elif kind == "attach":
+            media_inputs.append({"source": value, "media_kind": classify_media_source(value)})
+        else:
+            raise NotifyError(f"unsupported media input kind: {kind}")
+    return media_inputs
 
 
 def ensure_local_media_path_exists(source: str, path_exists) -> None:
@@ -592,6 +617,69 @@ def send_media(
     return body
 
 
+def build_media_group_request(
+    token: str,
+    chat_id: str,
+    args: argparse.Namespace,
+    media_sources: list[str],
+    caption: str | None,
+    path_exists=None,
+) -> urllib.request.Request:
+    path_exists = Path.exists if path_exists is None else path_exists
+    media: list[dict[str, object]] = []
+    files: dict[str, object] = {}
+
+    for index, source in enumerate(media_sources):
+        normalized = normalize_media_source(source)
+        parsed = urlparse(normalized)
+        is_remote = parsed.scheme in {"http", "https"}
+        is_local_path = not is_remote and path_exists(Path(normalized))
+        media_value = normalized
+        if is_local_path:
+            attachment_name = f"file{index}"
+            media_value = f"attach://{attachment_name}"
+            files[attachment_name] = normalized
+
+        item: dict[str, object] = {"type": "photo", "media": media_value}
+        if index == 0 and caption:
+            item["caption"] = caption
+            if args.html:
+                item["parse_mode"] = "HTML"
+            elif args.markdownv2:
+                item["parse_mode"] = "MarkdownV2"
+        media.append(item)
+
+    fields: dict[str, object] = {"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=False)}
+    if args.silent:
+        fields["disable_notification"] = True
+    return build_multipart_request(token, "sendMediaGroup", fields, files)
+
+
+def send_media_group(
+    token: str,
+    chat_id: str,
+    args: argparse.Namespace,
+    media_sources: list[str],
+    caption: str | None,
+    opener,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    path_exists=None,
+):
+    request = build_media_group_request(token, chat_id, args, media_sources, caption, path_exists=path_exists)
+    with opener.open(request, timeout=timeout) as response:
+        raw_body = response.read()
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
+
+    if not body.get("ok"):
+        description = body.get("description", "unknown Telegram API error")
+        raise NotifyError(f"Telegram API error: {description}")
+    return body
+
+
 def main(
     argv=None,
     stdin=None,
@@ -619,9 +707,8 @@ def main(
 
     try:
         args = parser.parse_args(argv)
-        media_input = resolve_media_args(args)
-        media_source = media_input[0] if media_input else None
-        media_kind = media_input[1] if media_input else None
+        media_inputs = resolve_media_inputs(args)
+        media_source = media_inputs[0]["source"] if media_inputs else None
         message_uses_stdin = args.message_parts == ["-"] or (
             not args.message_parts
             and not args.message_file
@@ -649,17 +736,15 @@ def main(
                 quote_text = format_quote_block(quote_raw.rstrip("\n"), parse_mode)
         text = build_text_body(args, message_text, quote_text)
 
-        if media_source:
-            method = "sendPhoto" if media_kind == "photo" else "sendDocument"
-            ensure_local_media_path_exists(media_source, path_exists)
-
-            try:
-                parsed_source = urlparse(media_source)
-                if parsed_source.scheme not in {"http", "https"} and path_exists(media_source):
-                    ensure_local_media_size(media_source, media_kind, stat_fn=stat_fn)
-            except NotifyError:
-                if not args.fallback_link:
-                    raise
+        if media_inputs:
+            if args.album:
+                if len(media_inputs) < 2:
+                    raise NotifyError("album mode requires at least two photo items")
+                if len(media_inputs) > TELEGRAM_MEDIA_GROUP_LIMIT:
+                    raise NotifyError(f"album mode allows up to {TELEGRAM_MEDIA_GROUP_LIMIT} items")
+                if any(item["media_kind"] != "photo" for item in media_inputs):
+                    raise NotifyError("album mode supports only photo media")
+            def send_fallback(opener=None):
                 fallback_text = build_fallback_text(text, args.fallback_link, caption_text)
                 if args.dry_run:
                     emit_result(
@@ -675,10 +760,10 @@ def main(
                     return 0
 
                 token, chat_id, proxy_url = resolve_runtime_settings()
-                opener = opener_factory(proxy_url)
+                actual_opener = opener or opener_factory(proxy_url)
                 fallback_chunks_sent = 0
                 for chunk in chunk_text_message(fallback_text):
-                    send_message(token, build_payload(chat_id, args, chunk), opener)
+                    send_message(token, build_payload(chat_id, args, chunk), actual_opener)
                     fallback_chunks_sent += 1
                 emit_result(
                     stdout,
@@ -693,13 +778,32 @@ def main(
                 )
                 return 0
 
+            try:
+                for item in media_inputs:
+                    source = item["source"]
+                    media_kind = item["media_kind"]
+                    ensure_local_media_path_exists(source, path_exists)
+                    normalized_source = normalize_media_source(source)
+                    parsed_source = urlparse(normalized_source)
+                    if parsed_source.scheme not in {"http", "https"} and path_exists(normalized_source):
+                        ensure_local_media_size(normalized_source, media_kind, stat_fn=stat_fn)
+            except NotifyError:
+                if not args.fallback_link:
+                    raise
+                return send_fallback()
+
             caption_chunks = chunk_caption_text(caption_text or text)
-            media_caption = caption_chunks[0] if caption_chunks and caption_chunks[0] else None
+            primary_caption = caption_chunks[0] if caption_chunks and caption_chunks[0] else None
             followup_chunks = caption_chunks[1:]
             if caption_text is not None and text.strip():
                 followup_chunks.extend(chunk_text_message(text))
 
             if args.dry_run:
+                method = "sendMediaGroup" if args.album else (
+                    "sendSequence" if len(media_inputs) > 1 else (
+                        "sendPhoto" if media_inputs[0]["media_kind"] == "photo" else "sendDocument"
+                    )
+                )
                 emit_result(
                     stdout,
                     args.json,
@@ -716,36 +820,36 @@ def main(
 
             token, chat_id, proxy_url = resolve_runtime_settings()
             opener = opener_factory(proxy_url)
+            media_sent_count = 0
             try:
-                send_media(
-                    token,
-                    method,
-                    "photo" if media_kind == "photo" else "document",
-                    media_source,
-                    build_media_payload(chat_id, args, media_caption),
-                    opener,
-                    path_exists=lambda path: path_exists(str(path)),
-                )
+                if args.album:
+                    send_media_group(
+                        token,
+                        chat_id,
+                        args,
+                        [item["source"] for item in media_inputs],
+                        primary_caption,
+                        opener,
+                        path_exists=lambda path: path_exists(str(path)),
+                    )
+                    media_sent_count = len(media_inputs)
+                else:
+                    for index, item in enumerate(media_inputs):
+                        media_kind = item["media_kind"]
+                        send_media(
+                            token,
+                            "sendPhoto" if media_kind == "photo" else "sendDocument",
+                            "photo" if media_kind == "photo" else "document",
+                            item["source"],
+                            build_media_payload(chat_id, args, primary_caption if index == 0 else None),
+                            opener,
+                            path_exists=lambda path: path_exists(str(path)),
+                        )
+                        media_sent_count += 1
             except (NotifyError, urllib.error.HTTPError, urllib.error.URLError):
-                if not args.fallback_link:
+                if not args.fallback_link or media_sent_count > 0:
                     raise
-                fallback_text = build_fallback_text(text, args.fallback_link, caption_text)
-                fallback_chunks_sent = 0
-                for chunk in chunk_text_message(fallback_text):
-                    send_message(token, build_payload(chat_id, args, chunk), opener)
-                    fallback_chunks_sent += 1
-                emit_result(
-                    stdout,
-                    args.json,
-                    {
-                        "ok": True,
-                        "method": "sendMessage",
-                        "sent": True,
-                        "fallback_sent": True,
-                        "chunks_sent": fallback_chunks_sent,
-                    },
-                )
-                return 0
+                return send_fallback(opener=opener)
             for chunk in followup_chunks:
                 send_message(token, build_payload(chat_id, args, chunk), opener)
             emit_result(
@@ -753,7 +857,11 @@ def main(
                 args.json,
                 {
                     "ok": True,
-                    "method": method,
+                    "method": "sendMediaGroup" if args.album else (
+                        "sendSequence" if len(media_inputs) > 1 else (
+                            "sendPhoto" if media_inputs[0]["media_kind"] == "photo" else "sendDocument"
+                        )
+                    ),
                     "sent": True,
                     "media_sent": True,
                     "followup_sent": bool(followup_chunks),
