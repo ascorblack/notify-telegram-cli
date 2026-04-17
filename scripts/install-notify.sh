@@ -10,4 +10,7 @@ print_config_hint
 
 if [[ ":$PATH:" != *":$NOTIFY_INSTALL_BIN_DIR:"* ]]; then
   log "Note: $NOTIFY_INSTALL_BIN_DIR is not currently in PATH."
+  log "Run directly for now: $NOTIFY_INSTALL_BIN_DIR/notify --help"
+  log "To add it permanently, add this to your shell profile:"
+  log "  export PATH=\"$NOTIFY_INSTALL_BIN_DIR:\$PATH\""
 fi

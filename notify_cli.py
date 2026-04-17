@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 import uuid
 import urllib.error
@@ -59,6 +60,9 @@ RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def get_default_config_path() -> Path:
+    config_dir = os.environ.get("NOTIFY_INSTALL_CONFIG_DIR")
+    if config_dir:
+        return Path(config_dir) / "config.json"
     return Path.home() / ".config" / "notify-telegram-cli" / "config.json"
 
 
@@ -76,6 +80,7 @@ def load_local_config(config_path: Path | None = None) -> dict[str, object]:
 
 
 def resolve_runtime_settings(config_path: Path | None = None) -> tuple[str, str, str]:
+    effective_config_path = config_path or get_default_config_path()
     config = load_local_config(config_path)
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or str(config.get("bot_token") or "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID") or str(config.get("chat_id") or "")
@@ -84,12 +89,12 @@ def resolve_runtime_settings(config_path: Path | None = None) -> tuple[str, str,
     if not token:
         raise NotifyError(
             "telegram bot token is not configured; set TELEGRAM_BOT_TOKEN or "
-            "~/.config/notify-telegram-cli/config.json"
+            f"{effective_config_path}"
         )
     if not chat_id:
         raise NotifyError(
             "telegram chat id is not configured; set TELEGRAM_CHAT_ID or "
-            "~/.config/notify-telegram-cli/config.json"
+            f"{effective_config_path}"
         )
     return token, chat_id, proxy_url
 
@@ -259,6 +264,37 @@ def normalize_string_list(value: object, field_name: str) -> list[str]:
     raise NotifyError(f"json input field '{field_name}' must be a string or list")
 
 
+def normalize_boolean(value: object, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise NotifyError(
+        f"json input field '{field_name}' must be a boolean or one of true/false/1/0/yes/no/on/off"
+    )
+
+
+def normalize_parse_mode(value: object) -> tuple[bool, bool]:
+    if value is None:
+        return False, False
+    if not isinstance(value, str):
+        raise NotifyError("json input field 'parse_mode' must be a string or null")
+    normalized = value.strip().lower()
+    if normalized in {"", "plain", "plaintext", "none"}:
+        return False, False
+    if normalized == "html":
+        return True, False
+    if normalized == "markdownv2":
+        return False, True
+    raise NotifyError("json input field 'parse_mode' must be one of html, markdownv2, plain, none")
+
+
 def normalize_event_payload(value: object) -> dict[str, object] | None:
     if value is None:
         return None
@@ -318,15 +354,15 @@ def apply_json_input(args: argparse.Namespace, payload: dict[str, object]) -> ar
     if "meta" in payload:
         args.meta = normalize_meta_payload(payload["meta"])
     if "silent" in payload:
-        args.silent = bool(payload["silent"])
+        args.silent = normalize_boolean(payload["silent"], "silent")
     if "disable_web_preview" in payload:
-        args.disable_web_preview = bool(payload["disable_web_preview"])
+        args.disable_web_preview = normalize_boolean(
+            payload["disable_web_preview"], "disable_web_preview"
+        )
     if "album" in payload:
-        args.album = bool(payload["album"])
-    parse_mode = str(payload.get("parse_mode", "")).lower() if "parse_mode" in payload else ""
-    if parse_mode:
-        args.html = parse_mode == "html"
-        args.markdownv2 = parse_mode == "markdownv2"
+        args.album = normalize_boolean(payload["album"], "album")
+    if "parse_mode" in payload:
+        args.html, args.markdownv2 = normalize_parse_mode(payload["parse_mode"])
     media_items = []
     if "media" in payload:
         media = payload["media"]
@@ -723,19 +759,37 @@ def is_retryable_http_error(exc: urllib.error.HTTPError) -> bool:
     return exc.code in RETRYABLE_HTTP_STATUS_CODES
 
 
+def compute_retry_delay(exc: Exception, attempt_index: int) -> float:
+    if isinstance(exc, urllib.error.HTTPError):
+        retry_after = None
+        if getattr(exc, "headers", None):
+            retry_after = exc.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(0.0, min(float(retry_after), 30.0))
+            except ValueError:
+                pass
+    return min(0.25 * (2**attempt_index), 2.0)
+
+
 def open_with_retry(opener, request, timeout: int, retries: int):
     attempts_remaining = max(0, retries)
+    attempt_index = 0
     while True:
         try:
             return opener.open(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
             if attempts_remaining <= 0 or not is_retryable_http_error(exc):
                 raise
+            time.sleep(compute_retry_delay(exc, attempt_index))
             attempts_remaining -= 1
+            attempt_index += 1
         except urllib.error.URLError:
             if attempts_remaining <= 0:
                 raise
+            time.sleep(compute_retry_delay(urllib.error.URLError("retry"), attempt_index))
             attempts_remaining -= 1
+            attempt_index += 1
 
 
 def normalize_multipart_field_value(value: object) -> str:
@@ -990,6 +1044,24 @@ def inspect_runtime_settings(config_path: Path | None = None) -> dict[str, objec
     return result
 
 
+def get_expected_launcher_path() -> Path:
+    bin_dir = os.environ.get("NOTIFY_INSTALL_BIN_DIR")
+    if bin_dir:
+        return Path(bin_dir) / "notify"
+    return Path.home() / ".local" / "bin" / "notify"
+
+
+def get_skill_paths() -> dict[str, Path]:
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    agents_skill_root = Path(os.environ.get("LEGACY_AGENTS_SKILL_DIR") or (Path.home() / ".agents" / "skills"))
+    claude_home = Path(os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude"))
+    return {
+        "codex_skill": codex_home / "skills" / "notify-telegram" / "SKILL.md",
+        "agents_skill": agents_skill_root / "notify-telegram" / "SKILL.md",
+        "claude_skill": claude_home / "skills" / "notify-telegram" / "SKILL.md",
+    }
+
+
 def format_check_line(status: str, name: str, message: str) -> str:
     return f"[{status}] {name}: {message}"
 
@@ -1001,6 +1073,7 @@ def run_doctor(
     opener_factory,
     timeout: int,
     retries: int,
+    program_path: str | None = None,
 ) -> int:
     checks: list[dict[str, object]] = []
     runtime = inspect_runtime_settings()
@@ -1018,26 +1091,47 @@ def run_doctor(
     if runtime["token"]:
         add_check("token", "ok", f"configured via {runtime['token_source']}")
     else:
-        add_check("token", "fail", "missing TELEGRAM_BOT_TOKEN or config bot_token")
+        add_check("token", "warn", "missing TELEGRAM_BOT_TOKEN or config bot_token")
 
     if runtime["chat_id"]:
         add_check("chat_id", "ok", f"configured via {runtime['chat_id_source']}")
     else:
-        add_check("chat_id", "fail", "missing TELEGRAM_CHAT_ID or config chat_id")
+        add_check("chat_id", "warn", "missing TELEGRAM_CHAT_ID or config chat_id")
 
     add_check("proxy", "ok", f"{runtime['proxy_url']} via {runtime['proxy_source']}")
 
-    launcher_path = shutil.which("notify")
-    if launcher_path:
-        add_check("launcher", "ok", launcher_path)
+    expected_launcher_path = get_expected_launcher_path()
+    launcher_on_path = shutil.which("notify")
+    invoked_launcher_path = None
+    raw_program_path = os.environ.get("NOTIFY_LAUNCHER_PATH") or program_path
+    if raw_program_path:
+        candidate = Path(raw_program_path)
+        try:
+            if candidate.exists() and candidate.name == "notify":
+                invoked_launcher_path = candidate.resolve()
+        except OSError:
+            invoked_launcher_path = None
+    if expected_launcher_path.exists():
+        if invoked_launcher_path and invoked_launcher_path == expected_launcher_path.resolve():
+            add_check("launcher", "ok", str(expected_launcher_path))
+        elif launcher_on_path and Path(launcher_on_path).resolve() == expected_launcher_path.resolve():
+            add_check("launcher", "ok", str(expected_launcher_path))
+        elif launcher_on_path:
+            add_check(
+                "launcher",
+                "warn",
+                f"installed at {expected_launcher_path}, but PATH resolves notify to {launcher_on_path}",
+            )
+        else:
+            add_check(
+                "launcher",
+                "warn",
+                f"installed at {expected_launcher_path}, but it is not currently on PATH",
+            )
     else:
-        add_check("launcher", "warn", "notify not found in PATH")
+        add_check("launcher", "warn", f"expected launcher not found at {expected_launcher_path}")
 
-    skill_paths = {
-        "codex_skill": Path.home() / ".codex" / "skills" / "notify-telegram" / "SKILL.md",
-        "agents_skill": Path.home() / ".agents" / "skills" / "notify-telegram" / "SKILL.md",
-        "claude_skill": Path.home() / ".claude" / "skills" / "notify-telegram" / "SKILL.md",
-    }
+    skill_paths = get_skill_paths()
     for name, path in skill_paths.items():
         if path.exists():
             add_check(name, "ok", str(path))
@@ -1074,8 +1168,15 @@ def run_doctor(
             add_check("telegram", "fail", str(exc))
 
     failed = any(check["status"] == "fail" for check in checks)
+    ready_to_send = bool(runtime["token"] and runtime["chat_id"])
+    if ready_to_send:
+        ready_to_send = not any(check["name"] == "telegram" and check["status"] == "fail" for check in checks)
+        ready_to_send = ready_to_send and any(
+            check["name"] == "telegram_getChat" and check["status"] == "ok" for check in checks
+        )
     result = {
         "ok": not failed,
+        "ready_to_send": ready_to_send,
         "command": "doctor",
         "checks": checks,
         "runtime": {
@@ -1160,6 +1261,7 @@ def main(
                 opener_factory=opener_factory,
                 timeout=args.timeout,
                 retries=args.retries,
+                program_path=sys.argv[0],
             )
         validate_json_input_compatibility(args)
         if args.json:

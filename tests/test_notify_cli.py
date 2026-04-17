@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 import tempfile
+import urllib.error
 from pathlib import Path
 
 
@@ -110,6 +111,27 @@ class NotifyCliTests(unittest.TestCase):
         args = self.parse(["--doctor", "--json-output"])
         self.assertTrue(args.doctor)
         self.assertTrue(args.json_output)
+
+    def test_apply_json_input_parses_string_bools_safely(self):
+        args = self.parse([])
+        args = self.module.apply_json_input(
+            args,
+            {
+                "silent": "false",
+                "disable_web_preview": "0",
+                "album": "no",
+            },
+        )
+
+        self.assertFalse(args.silent)
+        self.assertFalse(args.disable_web_preview)
+        self.assertFalse(args.album)
+
+    def test_apply_json_input_rejects_invalid_parse_mode(self):
+        args = self.parse(["--html"])
+
+        with self.assertRaisesRegex(self.module.NotifyError, "parse_mode"):
+            self.module.apply_json_input(args, {"parse_mode": "bogus"})
 
     def test_caption_flags_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
@@ -430,6 +452,23 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(proxy_handler.proxies["http"], "http://127.0.0.1:10809")
         self.assertEqual(proxy_handler.proxies["https"], "http://127.0.0.1:10809")
 
+    def test_compute_retry_delay_uses_retry_after_header(self):
+        error = urllib.error.HTTPError(
+            "https://example.com",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "3"},
+            io.BytesIO(b""),
+        )
+
+        delay = self.module.compute_retry_delay(error, 0)
+
+        self.assertEqual(delay, 3.0)
+
+    def test_compute_retry_delay_uses_exponential_backoff_for_network_errors(self):
+        delay = self.module.compute_retry_delay(urllib.error.URLError("boom"), 2)
+        self.assertEqual(delay, 1.0)
+
     def test_send_message_posts_json_payload(self):
         class DummyResponse:
             def __init__(self, body):
@@ -621,9 +660,9 @@ class NotifyCliTests(unittest.TestCase):
         self.assertIn("10809", help_text)
         self.assertIn("--fallback-link", help_text)
 
-    def test_wrapper_invokes_main(self):
-        wrapper = Path("/home/dev/.local/bin/notify").read_text(encoding="utf-8")
-        self.assertIn("from notify_cli import main", wrapper)
+    def test_wrapper_contract_matches_installed_launcher_template(self):
+        script = (MODULE_DIR / "scripts" / "lib" / "install-common.sh").read_text(encoding="utf-8")
+        self.assertIn('exec env NOTIFY_LAUNCHER_PATH="\\$0" python3 "$repo_root/notify_cli.py" "\\$@"', script)
 
     def test_main_errors_on_empty_message(self):
         stderr = io.StringIO()
@@ -803,7 +842,7 @@ class NotifyCliTests(unittest.TestCase):
         self.assertIn("checks", result)
         self.assertEqual(stderr.getvalue(), "")
 
-    def test_main_doctor_fails_when_token_missing(self):
+    def test_main_doctor_warns_when_token_missing(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
         old_env = os.environ.copy()
@@ -826,10 +865,101 @@ class NotifyCliTests(unittest.TestCase):
             os.environ.update(old_env)
 
         result = json.loads(stdout.getvalue())
-        self.assertEqual(exit_code, 1)
-        self.assertFalse(result["ok"])
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(result["ok"])
         self.assertEqual(result["command"], "doctor")
-        self.assertIn("token", stderr.getvalue().lower())
+        self.assertFalse(result["ready_to_send"])
+        token_check = next(check for check in result["checks"] if check["name"] == "token")
+        self.assertEqual(token_check["status"], "warn")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_main_doctor_respects_custom_install_env_paths(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                if request.full_url.endswith("/getMe"):
+                    return DummyResponse(
+                        b'{"ok": true, "result": {"id": 1, "is_bot": true, "username": "notify_bot"}}'
+                    )
+                if request.full_url.endswith("/getChat"):
+                    return DummyResponse(
+                        b'{"ok": true, "result": {"id": 999, "type": "private"}}'
+                    )
+                raise AssertionError(f"unexpected request url: {request.full_url}")
+
+        temp_home = tempfile.mkdtemp(prefix="notify-doctor-paths-")
+        custom_codex = Path(temp_home) / "codex-home"
+        custom_agents = Path(temp_home) / "agents-home" / "skills"
+        custom_claude = Path(temp_home) / "claude-home"
+        custom_bin = Path(temp_home) / "bin"
+        for path in (
+            custom_codex / "skills" / "notify-telegram",
+            custom_agents / "notify-telegram",
+            custom_claude / "skills" / "notify-telegram",
+            custom_bin,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        for skill_file in (
+            custom_codex / "skills" / "notify-telegram" / "SKILL.md",
+            custom_agents / "notify-telegram" / "SKILL.md",
+            custom_claude / "skills" / "notify-telegram" / "SKILL.md",
+        ):
+            skill_file.write_text("# skill\n", encoding="utf-8")
+        launcher = custom_bin / "notify"
+        launcher.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        launcher.chmod(0o755)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        old_env = os.environ.copy()
+        old_path = os.environ.get("PATH", "")
+        try:
+            os.environ["HOME"] = temp_home
+            os.environ["CODEX_HOME"] = str(custom_codex)
+            os.environ["LEGACY_AGENTS_SKILL_DIR"] = str(custom_agents)
+            os.environ["CLAUDE_HOME"] = str(custom_claude)
+            os.environ["NOTIFY_INSTALL_BIN_DIR"] = str(custom_bin)
+            os.environ["PATH"] = f"{custom_bin}:{old_path}"
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            os.environ["TELEGRAM_PROXY_URL"] = "http://127.0.0.1:19090"
+            exit_code = self.module.main(
+                ["--doctor", "--json-output"],
+                stdin=io.StringIO(""),
+                stdout=stdout,
+                stderr=stderr,
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: DummyOpener(),
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(result["ready_to_send"])
+        checks = {check["name"]: check for check in result["checks"]}
+        self.assertEqual(checks["codex_skill"]["status"], "ok")
+        self.assertEqual(checks["agents_skill"]["status"], "ok")
+        self.assertEqual(checks["claude_skill"]["status"], "ok")
+        self.assertEqual(checks["launcher"]["status"], "ok")
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_main_rejects_json_input_with_inline_message(self):
         stderr = io.StringIO()

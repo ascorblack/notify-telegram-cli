@@ -68,7 +68,7 @@ install_launcher() {
   cat >"$launcher_path" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec python3 "$repo_root/notify_cli.py" "\$@"
+exec env NOTIFY_LAUNCHER_PATH="\$0" python3 "$repo_root/notify_cli.py" "\$@"
 EOF
   chmod +x "$launcher_path"
 

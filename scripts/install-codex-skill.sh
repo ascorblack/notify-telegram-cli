@@ -15,4 +15,10 @@ copy_skill_dir "$REPO_ROOT" "$LEGACY_AGENTS_SKILL_DIR"
 log "Installed Codex skill: $CODEX_HOME_DIR/skills/notify-telegram"
 log "Installed compatibility skill copy: $LEGACY_AGENTS_SKILL_DIR/notify-telegram"
 print_config_hint
+if [[ ":$PATH:" != *":$NOTIFY_INSTALL_BIN_DIR:"* ]]; then
+  log "Note: $NOTIFY_INSTALL_BIN_DIR is not currently in PATH."
+  log "Run directly for now: $NOTIFY_INSTALL_BIN_DIR/notify --help"
+  log "To add it permanently, add this to your shell profile:"
+  log "  export PATH=\"$NOTIFY_INSTALL_BIN_DIR:\$PATH\""
+fi
 log "Restart Codex to pick up the new skill if it is already running."

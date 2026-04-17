@@ -101,7 +101,7 @@ If the repository stays private, make sure `git clone` already works in your env
 Short Codex version:
 
 ```text
-Clone or update the private repo `ascorblack/notify-telegram-cli` into `~/.local/share/notify-telegram-cli/repo` using plain `git`, run `scripts/install-codex-skill.sh`, verify `command -v notify`, verify the skill exists under the local Codex skill directory, run `notify --doctor --json-output`, and show me `notify --help`. Do not put secrets into the git repo. If `~/.config/notify-telegram-cli/config.json` already exists, leave it unchanged.
+Clone or update the private repo `ascorblack/notify-telegram-cli` into `~/.local/share/notify-telegram-cli/repo` using plain `git`, run `scripts/install-codex-skill.sh`, verify that `~/.local/bin/notify` exists, verify the skill exists under the local Codex skill directory, run `~/.local/bin/notify --doctor --json-output`, and show me `~/.local/bin/notify --help`. Do not put secrets into the git repo. If `~/.config/notify-telegram-cli/config.json` already exists, leave it unchanged.
 ```
 
 ## Local Usage
@@ -125,6 +125,7 @@ notify --file huge.tar --fallback-link https://example.com/huge.tar
 notify --json '{"message":"dry run","media":[{"type":"photo","source":"./shot.png"}]}' --dry-run --json-output
 notify --doctor
 notify --doctor --json-output
+~/.local/bin/notify --doctor --json-output
 ```
 
 ## JSON Schema
@@ -157,6 +158,8 @@ Agent-friendly JSON fields:
 - whether `notify` is on `PATH`
 - Codex/Claude skill installation paths
 - Telegram `getMe` and `getChat` reachability through the configured proxy
+
+`ok` means there are no hard failures. `ready_to_send` is stricter and tells an agent whether token/chat configuration is present and Telegram delivery checks passed. On a fresh install without secrets, expect warnings and `ready_to_send: false`.
 
 ## Development
 

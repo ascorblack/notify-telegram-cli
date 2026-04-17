@@ -83,6 +83,8 @@ notify --doctor
 notify --doctor --json-output
 ```
 
+On a fresh install without secrets, `--doctor` may return warnings with `ready_to_send: false`. That still means the CLI is installed; it just is not configured for delivery yet.
+
 ## JSON Input Shape
 
 Useful fields:
