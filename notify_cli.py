@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 DEFAULT_PROXY_URL = "http://127.0.0.1:10809"
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "notify-telegram-cli" / "config.json"
 DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_RETRY_COUNT = 2
 FILE_ID_PREFIX = "file_id:"
 PHOTO_MAX_BYTES = 10 * 1024 * 1024
 DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
@@ -52,6 +53,9 @@ class NotifyArgumentParser(argparse.ArgumentParser):
         if getattr(parsed, "message_file", None) and getattr(parsed, "message_parts", None):
             self.error("message_parts are not allowed with --message-file")
         return parsed
+
+
+RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def load_local_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, object]:
@@ -111,6 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
 Input modes:
   notify "hello world"
   notify --html "<b>Deploy done</b>"
+  notify --json '{"message":"hello from agent","title":"Deploy"}'
+  cat payload.json | notify --json -
   printf 'line1\\nline2\\n' | notify -
   notify --message-file summary.txt
   notify --markdownv2 -
@@ -193,8 +199,11 @@ Local config:
     parser.add_argument("--link", action="append", default=[], help="link to include")
     parser.add_argument("--fallback-link", help="link to send if media upload cannot be delivered")
     parser.add_argument("--quote", metavar="SOURCE", help="quote text from a local file")
-    parser.add_argument("--json", action="store_true", help="print JSON output")
+    parser.add_argument("--json", metavar="SOURCE", help="read full notification spec from JSON, '-' for stdin, '@path' for file")
+    parser.add_argument("--json-output", action="store_true", help="print machine-readable JSON result")
     parser.add_argument("--dry-run", action="store_true", help="print the request without sending")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRY_COUNT, help="retry count for temporary network/API failures")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="request timeout in seconds")
     parser.add_argument("--message-file", metavar="PATH", help="read message body from a local file")
     caption_group = parser.add_mutually_exclusive_group()
     caption_group.add_argument("--caption", help="media caption text; pass '-' to read from stdin")
@@ -214,6 +223,98 @@ def read_text_file(path: str, label: str) -> str:
         raise NotifyError(f"unable to read {label}: {exc}") from exc
 
 
+def load_json_input(source: str, stdin) -> dict[str, object]:
+    if source == "-":
+        raw = stdin.read()
+    elif source.startswith("@"):
+        raw = read_text_file(source[1:], "json input file")
+    else:
+        raw = source
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise NotifyError(f"json input is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise NotifyError("json input must be a JSON object")
+    return payload
+
+
+def apply_json_input(args: argparse.Namespace, payload: dict[str, object]) -> argparse.Namespace:
+    if "message" in payload and "message_parts" not in payload:
+        message = payload["message"]
+        args.message_parts = [message] if isinstance(message, str) else []
+    if "title" in payload and isinstance(payload["title"], str):
+        args.title = payload["title"]
+    if "tag" in payload and isinstance(payload["tag"], list):
+        args.tag = [str(item) for item in payload["tag"]]
+    if "link" in payload and isinstance(payload["link"], list):
+        args.link = [str(item) for item in payload["link"]]
+    if "quote" in payload and isinstance(payload["quote"], str):
+        args.quote = payload["quote"]
+    if "caption" in payload and isinstance(payload["caption"], str):
+        args.caption = payload["caption"]
+    if "fallback_link" in payload and isinstance(payload["fallback_link"], str):
+        args.fallback_link = payload["fallback_link"]
+    if "silent" in payload:
+        args.silent = bool(payload["silent"])
+    if "disable_web_preview" in payload:
+        args.disable_web_preview = bool(payload["disable_web_preview"])
+    if "album" in payload:
+        args.album = bool(payload["album"])
+    parse_mode = str(payload.get("parse_mode", "")).lower() if "parse_mode" in payload else ""
+    if parse_mode:
+        args.html = parse_mode == "html"
+        args.markdownv2 = parse_mode == "markdownv2"
+    media_items = []
+    if "media" in payload:
+        media = payload["media"]
+        if not isinstance(media, list):
+            raise NotifyError("json input field 'media' must be a list")
+        for item in media:
+            if not isinstance(item, dict):
+                raise NotifyError("json input field 'media' entries must be objects")
+            media_type = item.get("type")
+            source = item.get("source")
+            if not isinstance(source, str) or not isinstance(media_type, str):
+                raise NotifyError("json input media entries require string 'type' and 'source'")
+            mapping = {
+                "photo": "photo",
+                "photo_id": "photo_id",
+                "file": "file",
+                "file_id": "file_id",
+                "attach": "attach",
+            }
+            if media_type not in mapping:
+                raise NotifyError(f"unsupported json media type: {media_type}")
+            media_items.append((mapping[media_type], source))
+    else:
+        for key in ("photo", "photo_id", "file", "file_id", "attach"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                media_items.append((key, value))
+    if media_items:
+        args.media_items = media_items
+        args.photo = args.photo_id = args.file = args.file_id = args.attach = None
+        for kind, value in media_items:
+            setattr(args, kind, value)
+    return args
+
+
+def validate_json_input_compatibility(args: argparse.Namespace) -> None:
+    if not args.json:
+        return
+    if args.message_parts:
+        raise NotifyError("--json cannot be combined with inline message text")
+    if args.message_file:
+        raise NotifyError("--json cannot be combined with --message-file")
+    if args.quote:
+        raise NotifyError("--json cannot be combined with --quote")
+    if args.caption or args.caption_file:
+        raise NotifyError("--json cannot be combined with caption flags")
+    if args.media_items:
+        raise NotifyError("--json cannot be combined with media flags")
+
+
 def resolve_message(
     args: argparse.Namespace,
     stdin,
@@ -224,7 +325,7 @@ def resolve_message(
     if args.message_file:
         text = read_text_file(args.message_file, "message file")
     elif args.message_parts:
-        if args.message_parts == ["-"]:
+        if args.message_parts == ["-"] and not getattr(args, "json", None):
             text = stdin.read()
         else:
             text = " ".join(args.message_parts)
@@ -254,7 +355,7 @@ def resolve_caption(
         caption = args.caption
         if caption is None:
             return None
-    if caption == "-":
+    if caption == "-" and not getattr(args, "json", None):
         if message_uses_stdin:
             raise NotifyError("caption stdin is ambiguous when message also reads from stdin")
         caption = stdin.read()
@@ -482,6 +583,25 @@ def build_json_request(token: str, method: str, payload: dict[str, object]) -> u
     )
 
 
+def is_retryable_http_error(exc: urllib.error.HTTPError) -> bool:
+    return exc.code in RETRYABLE_HTTP_STATUS_CODES
+
+
+def open_with_retry(opener, request, timeout: int, retries: int):
+    attempts_remaining = max(0, retries)
+    while True:
+        try:
+            return opener.open(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if attempts_remaining <= 0 or not is_retryable_http_error(exc):
+                raise
+            attempts_remaining -= 1
+        except urllib.error.URLError:
+            if attempts_remaining <= 0:
+                raise
+            attempts_remaining -= 1
+
+
 def normalize_multipart_field_value(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -534,9 +654,15 @@ def build_multipart_request(
     )
 
 
-def send_message(token: str, payload: dict[str, object], opener, timeout: int = DEFAULT_TIMEOUT_SECONDS):
+def send_message(
+    token: str,
+    payload: dict[str, object],
+    opener,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRY_COUNT,
+):
     request = build_json_request(token, "sendMessage", payload)
-    with opener.open(request, timeout=timeout) as response:
+    with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
         raw_body = response.read()
 
     try:
@@ -588,6 +714,7 @@ def send_media(
     payload: dict[str, object],
     opener,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRY_COUNT,
     path_exists=None,
 ):
     path_exists = Path.exists if path_exists is None else path_exists
@@ -603,7 +730,7 @@ def send_media(
         request_payload[source_field] = source
         request = build_json_request(token, method, request_payload)
 
-    with opener.open(request, timeout=timeout) as response:
+    with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
         raw_body = response.read()
 
     try:
@@ -663,10 +790,11 @@ def send_media_group(
     caption: str | None,
     opener,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRY_COUNT,
     path_exists=None,
 ):
     request = build_media_group_request(token, chat_id, args, media_sources, caption, path_exists=path_exists)
-    with opener.open(request, timeout=timeout) as response:
+    with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
         raw_body = response.read()
 
     try:
@@ -707,13 +835,18 @@ def main(
 
     try:
         args = parser.parse_args(argv)
+        validate_json_input_compatibility(args)
+        if args.json:
+            args = apply_json_input(args, load_json_input(args.json, stdin))
         media_inputs = resolve_media_inputs(args)
         media_source = media_inputs[0]["source"] if media_inputs else None
-        message_uses_stdin = args.message_parts == ["-"] or (
+        message_uses_stdin = (not args.json) and (
+            args.message_parts == ["-"] or (
             not args.message_parts
             and not args.message_file
             and not stdin_is_tty
             and not (media_source and args.caption == "-")
+            )
         )
         caption_text = resolve_caption(
             args,
@@ -749,7 +882,7 @@ def main(
                 if args.dry_run:
                     emit_result(
                         stdout,
-                        args.json,
+                        args.json_output,
                         {
                             "ok": True,
                             "method": "sendMessage",
@@ -763,11 +896,17 @@ def main(
                 actual_opener = opener or opener_factory(proxy_url)
                 fallback_chunks_sent = 0
                 for chunk in chunk_text_message(fallback_text):
-                    send_message(token, build_payload(chat_id, args, chunk), actual_opener)
+                    send_message(
+                        token,
+                        build_payload(chat_id, args, chunk),
+                        actual_opener,
+                        timeout=args.timeout,
+                        retries=args.retries,
+                    )
                     fallback_chunks_sent += 1
                 emit_result(
                     stdout,
-                    args.json,
+                    args.json_output,
                     {
                         "ok": True,
                         "method": "sendMessage",
@@ -806,7 +945,7 @@ def main(
                 )
                 emit_result(
                     stdout,
-                    args.json,
+                    args.json_output,
                     {
                         "ok": True,
                         "method": method,
@@ -830,6 +969,8 @@ def main(
                         [item["source"] for item in media_inputs],
                         primary_caption,
                         opener,
+                        timeout=args.timeout,
+                        retries=args.retries,
                         path_exists=lambda path: path_exists(str(path)),
                     )
                     media_sent_count = len(media_inputs)
@@ -843,6 +984,8 @@ def main(
                             item["source"],
                             build_media_payload(chat_id, args, primary_caption if index == 0 else None),
                             opener,
+                            timeout=args.timeout,
+                            retries=args.retries,
                             path_exists=lambda path: path_exists(str(path)),
                         )
                         media_sent_count += 1
@@ -851,10 +994,16 @@ def main(
                     raise
                 return send_fallback(opener=opener)
             for chunk in followup_chunks:
-                send_message(token, build_payload(chat_id, args, chunk), opener)
+                send_message(
+                    token,
+                    build_payload(chat_id, args, chunk),
+                    opener,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                )
             emit_result(
                 stdout,
-                args.json,
+                args.json_output,
                 {
                     "ok": True,
                     "method": "sendMediaGroup" if args.album else (
@@ -874,11 +1023,17 @@ def main(
         opener = opener_factory(proxy_url)
         chunks_sent = 0
         for chunk in chunk_text_message(text):
-            send_message(token, build_payload(chat_id, args, chunk), opener)
+            send_message(
+                token,
+                build_payload(chat_id, args, chunk),
+                opener,
+                timeout=args.timeout,
+                retries=args.retries,
+            )
             chunks_sent += 1
         emit_result(
             stdout,
-            args.json,
+            args.json_output,
             {
                 "ok": True,
                 "method": "sendMessage",
@@ -889,6 +1044,7 @@ def main(
         )
         return 0
     except NotifyError as exc:
+        emit_result(stdout, getattr(args, "json_output", False) if "args" in locals() else False, {"ok": False, "error_type": "notify", "message": str(exc)})
         print(f"notify: error: {exc}", file=stderr)
         return 2
     except urllib.error.HTTPError as exc:
@@ -896,10 +1052,12 @@ def main(
             detail = exc.read().decode("utf-8", errors="replace")
         except Exception:
             detail = str(exc)
+        emit_result(stdout, getattr(args, "json_output", False) if "args" in locals() else False, {"ok": False, "error_type": "http", "status_code": exc.code, "message": detail})
         print(f"notify: HTTP error {exc.code}: {detail}", file=stderr)
         return 1
     except urllib.error.URLError as exc:
         reason = getattr(exc, "reason", exc)
+        emit_result(stdout, getattr(args, "json_output", False) if "args" in locals() else False, {"ok": False, "error_type": "network", "message": str(reason)})
         print(f"notify: proxy/network error: {reason}", file=stderr)
         return 1
 

@@ -69,7 +69,7 @@ class NotifyCliTests(unittest.TestCase):
                 "success",
                 "--link",
                 "https://example.com/run/123",
-                "--json",
+                "--json-output",
                 "--dry-run",
             ]
         )
@@ -77,7 +77,7 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(args.title, "Deploy finished")
         self.assertEqual(args.tag, ["deploy", "success"])
         self.assertEqual(args.link, ["https://example.com/run/123"])
-        self.assertTrue(args.json)
+        self.assertTrue(args.json_output)
         self.assertTrue(args.dry_run)
 
     def test_parser_accepts_explicit_agent_input_flags(self):
@@ -89,11 +89,21 @@ class NotifyCliTests(unittest.TestCase):
                 "body.txt",
                 "--caption-file",
                 "caption.txt",
+                "--retries",
+                "3",
+                "--timeout",
+                "12",
             ]
         )
         self.assertEqual(args.photo_id, "AgACAgIA...")
         self.assertEqual(args.message_file, "body.txt")
         self.assertEqual(args.caption_file, "caption.txt")
+        self.assertEqual(args.retries, 3)
+        self.assertEqual(args.timeout, 12)
+
+    def test_parser_accepts_json_input_flag(self):
+        args = self.parse(["--json", '{"message":"hello"}'])
+        self.assertEqual(args.json, '{"message":"hello"}')
 
     def test_caption_flags_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
@@ -416,6 +426,83 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(opener.request.get_header("Content-type"), "application/json")
         self.assertEqual(opener.request.data, b'{"chat_id":"123","text":"hello"}')
 
+    def test_send_message_retries_on_urlerror_and_succeeds(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, request, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise self_module.urllib.error.URLError("temporary failure")
+                return DummyResponse(b'{"ok": true, "result": {"message_id": 1}}')
+
+        self_module = self.module
+        opener = DummyOpener()
+        result = self.module.send_message(
+            "token",
+            {"chat_id": "123", "text": "hello"},
+            opener,
+            retries=1,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(opener.calls, 2)
+
+    def test_send_message_retries_on_http_429_and_succeeds(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, request, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    fp = io.BytesIO(b'{"ok": false, "description": "Too Many Requests"}')
+                    raise self_module.urllib.error.HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        hdrs=None,
+                        fp=fp,
+                    )
+                return DummyResponse(b'{"ok": true, "result": {"message_id": 1}}')
+
+        self_module = self.module
+        opener = DummyOpener()
+        result = self.module.send_message(
+            "token",
+            {"chat_id": "123", "text": "hello"},
+            opener,
+            retries=1,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(opener.calls, 2)
+
     def test_build_json_request_for_send_message(self):
         request = self.module.build_json_request(
             "token",
@@ -517,10 +604,154 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertIn("message", stderr.getvalue().lower())
 
+    def test_main_prints_json_error_result(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        exit_code = self.module.main(
+            ["--json-output"],
+            stdin=io.StringIO(""),
+            stdout=stdout,
+            stderr=stderr,
+            stdin_is_tty=True,
+        )
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "notify")
+        self.assertIn("message", result["message"].lower())
+
+    def test_main_reads_message_from_json_input(self):
+        class DummyResponse:
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 14}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.request = None
+
+            def open(self, request, timeout=None):
+                self.request = request
+                return DummyResponse()
+
+        dummy_opener = DummyOpener()
+        exit_code = self.module.main(
+            ['--json', '{"message":"hello from json","title":"Deploy"}'],
+            stdin=io.StringIO(""),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            stdin_is_tty=True,
+            opener_factory=lambda proxy_url: dummy_opener,
+        )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(dummy_opener.request.data.decode("utf-8"))
+        self.assertEqual(payload["text"], "Deploy\n\nhello from json")
+
+    def test_main_reads_media_from_json_input(self):
+        stdout = io.StringIO()
+        exit_code = self.module.main(
+            ['--json', '{"message":"body","caption":"cap","media":[{"type":"photo","source":"/tmp/example.png"}]}', "--dry-run", "--json-output"],
+            stdin=io.StringIO(""),
+            stdout=stdout,
+            stderr=io.StringIO(),
+            stdin_is_tty=True,
+            path_exists=lambda path: True,
+            stat_fn=lambda path: type("DummyStat", (), {"st_size": 1024})(),
+            opener_factory=lambda proxy_url: self.fail("network should not be used"),
+        )
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["method"], "sendPhoto")
+        self.assertFalse(result["sent"])
+
+    def test_main_rejects_json_input_with_inline_message(self):
+        stderr = io.StringIO()
+        exit_code = self.module.main(
+            ['--json', '{"message":"hello"}', "extra"],
+            stdin=io.StringIO(""),
+            stdout=io.StringIO(),
+            stderr=stderr,
+            stdin_is_tty=True,
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("--json", stderr.getvalue())
+
+    def test_main_rejects_json_input_without_message_even_with_stdin(self):
+        stderr = io.StringIO()
+        exit_code = self.module.main(
+            ['--json', '{"title":"Deploy"}'],
+            stdin=io.StringIO("unexpected stdin body"),
+            stdout=io.StringIO(),
+            stderr=stderr,
+            stdin_is_tty=False,
+        )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("message", stderr.getvalue().lower())
+
+    def test_main_treats_dash_message_in_json_as_literal_text(self):
+        class DummyResponse:
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 15}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.request = None
+
+            def open(self, request, timeout=None):
+                self.request = request
+                return DummyResponse()
+
+        dummy_opener = DummyOpener()
+        exit_code = self.module.main(
+            ['--json', '{"message":"-"}'],
+            stdin=io.StringIO("unexpected stdin body"),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            stdin_is_tty=False,
+            opener_factory=lambda proxy_url: dummy_opener,
+        )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(dummy_opener.request.data.decode("utf-8"))
+        self.assertEqual(payload["text"], "-")
+
+    def test_main_treats_dash_caption_in_json_as_literal_text(self):
+        stdout = io.StringIO()
+        exit_code = self.module.main(
+            ['--json', '{"caption":"-","media":[{"type":"photo","source":"/tmp/example.png"}]}', "--dry-run", "--json-output"],
+            stdin=io.StringIO("unexpected caption body"),
+            stdout=stdout,
+            stderr=io.StringIO(),
+            stdin_is_tty=False,
+            path_exists=lambda path: True,
+            stat_fn=lambda path: type("DummyStat", (), {"st_size": 1024})(),
+            opener_factory=lambda proxy_url: self.fail("network should not be used"),
+        )
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["method"], "sendPhoto")
+
     def test_main_dry_run_reports_send_photo_without_network(self):
         stdout = io.StringIO()
         exit_code = self.module.main(
-            ["--photo", "/tmp/example.png", "--dry-run", "--json", "hello"],
+            ["--photo", "/tmp/example.png", "--dry-run", "--json-output", "hello"],
             stdin=io.StringIO(""),
             stdout=stdout,
             stderr=io.StringIO(),
@@ -538,7 +769,7 @@ class NotifyCliTests(unittest.TestCase):
     def test_main_dry_run_reports_send_document_for_file_id_flag(self):
         stdout = io.StringIO()
         exit_code = self.module.main(
-            ["--file-id", "AgACAgIA...", "--dry-run", "--json"],
+            ["--file-id", "AgACAgIA...", "--dry-run", "--json-output"],
             stdin=io.StringIO(""),
             stdout=stdout,
             stderr=io.StringIO(),
@@ -562,7 +793,7 @@ class NotifyCliTests(unittest.TestCase):
                 "--photo-id",
                 "AgACAgIAAlbum",
                 "--dry-run",
-                "--json",
+                "--json-output",
                 "album body",
             ],
             stdin=io.StringIO(""),
@@ -815,7 +1046,7 @@ class NotifyCliTests(unittest.TestCase):
     def test_main_allows_media_with_caption_without_message(self):
         stdout = io.StringIO()
         exit_code = self.module.main(
-            ["--photo", "/tmp/example.png", "--caption", "inline image smoke check", "--dry-run", "--json"],
+            ["--photo", "/tmp/example.png", "--caption", "inline image smoke check", "--dry-run", "--json-output"],
             stdin=io.StringIO(""),
             stdout=stdout,
             stderr=io.StringIO(),
@@ -999,7 +1230,7 @@ class NotifyCliTests(unittest.TestCase):
                     "/tmp/huge.tar",
                     "--fallback-link",
                     "https://example.com/huge.tar",
-                    "--json",
+                    "--json-output",
                     "artifact too large",
                 ],
                 stdin=io.StringIO(""),
@@ -1082,7 +1313,7 @@ class NotifyCliTests(unittest.TestCase):
     def test_main_allows_explicit_file_id_prefix(self):
         stdout = io.StringIO()
         exit_code = self.module.main(
-            ["--file", "file_id:ABCDEFGHIJKLMNOPQRSTUVWX", "--dry-run", "--json"],
+            ["--file", "file_id:ABCDEFGHIJKLMNOPQRSTUVWX", "--dry-run", "--json-output"],
             stdin=io.StringIO(""),
             stdout=stdout,
             stderr=io.StringIO(),
@@ -1138,7 +1369,7 @@ class NotifyCliTests(unittest.TestCase):
                     artifact_path,
                     "--fallback-link",
                     "https://example.com/logs.zip",
-                    "--json",
+                    "--json-output",
                     "artifact upload failed",
                 ],
                 stdin=io.StringIO(""),
@@ -1206,7 +1437,7 @@ class NotifyCliTests(unittest.TestCase):
                     "inline image smoke check",
                     "--fallback-link",
                     "https://example.com/photo.png",
-                    "--json",
+                    "--json-output",
                 ],
                 stdin=io.StringIO(""),
                 stdout=io.StringIO(),
@@ -1264,7 +1495,7 @@ class NotifyCliTests(unittest.TestCase):
                     artifact_path,
                     "--fallback-link",
                     "https://example.com/huge.log",
-                    "--json",
+                    "--json-output",
                     long_message,
                 ],
                 stdin=io.StringIO(""),
