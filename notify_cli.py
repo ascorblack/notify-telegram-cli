@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 DEFAULT_PROXY_URL = "http://127.0.0.1:10809"
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "notify-telegram-cli" / "config.json"
 DEFAULT_TIMEOUT_SECONDS = 20
+FILE_ID_PREFIX = "file_id:"
 PHOTO_MAX_BYTES = 10 * 1024 * 1024
 DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 TELEGRAM_MESSAGE_LIMIT = 4096
@@ -100,6 +101,19 @@ Input modes:
   second line
   EOF
 
+Media modes:
+  notify --photo screenshot.png --caption "UI after fix"
+  notify --file logs.zip --title "Incident logs"
+  notify --attach artifact.png --tag nightly --tag success
+  notify --file huge.tar --fallback-link https://example.com/huge.tar
+  notify --file file_id:ABC123... --caption "reuse Telegram-hosted file"
+
+Limits:
+  Upload photo: 10 MB
+  Upload document: 50 MB
+  URL photo: 5 MB
+  URL document: 20 MB
+
 Proxy:
   Requests go through the local Xray HTTP proxy by default:
     http://127.0.0.1:10809
@@ -143,6 +157,7 @@ Local config:
     parser.add_argument("--title", help="notification title")
     parser.add_argument("--tag", action="append", default=[], help="tag to include")
     parser.add_argument("--link", action="append", default=[], help="link to include")
+    parser.add_argument("--fallback-link", help="link to send if media upload cannot be delivered")
     parser.add_argument("--quote", metavar="SOURCE", help="quote text from a local file")
     parser.add_argument("--json", action="store_true", help="print JSON output")
     parser.add_argument("--dry-run", action="store_true", help="print the request without sending")
@@ -155,18 +170,28 @@ Local config:
     return parser
 
 
-def resolve_message(args: argparse.Namespace, stdin, stdin_is_tty: bool) -> str:
+def resolve_message(
+    args: argparse.Namespace,
+    stdin,
+    stdin_is_tty: bool,
+    required: bool = True,
+    implicit_stdin: bool = True,
+) -> str:
     if args.message_parts:
         if args.message_parts == ["-"]:
             text = stdin.read()
         else:
             text = " ".join(args.message_parts)
-    elif not stdin_is_tty:
+    elif implicit_stdin and not stdin_is_tty:
         text = stdin.read()
+    elif not required:
+        return ""
     else:
         raise NotifyError('message text is required; pass text or use "-" / stdin')
 
     if not text.strip():
+        if not required:
+            return ""
         raise NotifyError("message text is empty")
     return text
 
@@ -323,6 +348,28 @@ def classify_media_source(source: str) -> str:
     return "document"
 
 
+def looks_like_telegram_file_id(source: str) -> bool:
+    return source.startswith(FILE_ID_PREFIX)
+
+
+def normalize_media_source(source: str) -> str:
+    if source.startswith(FILE_ID_PREFIX):
+        return source[len(FILE_ID_PREFIX) :]
+    return source
+
+
+def ensure_local_media_path_exists(source: str, path_exists) -> None:
+    parsed = urlparse(source)
+    if parsed.scheme in {"http", "https"}:
+        return
+    normalized_source = normalize_media_source(source)
+    if path_exists(normalized_source):
+        return
+    if looks_like_telegram_file_id(source):
+        return
+    raise NotifyError(f"local media path does not exist: {source}")
+
+
 def ensure_local_media_size(source: str, media_kind: str, stat_fn=os.stat) -> None:
     if media_kind not in MEDIA_SIZE_LIMITS:
         raise NotifyError(f"unsupported media kind: {media_kind}")
@@ -368,6 +415,12 @@ def build_json_request(token: str, method: str, payload: dict[str, object]) -> u
     )
 
 
+def normalize_multipart_field_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def build_multipart_request(
     token: str,
     method: str,
@@ -385,7 +438,7 @@ def build_multipart_request(
         append_line(f"--{boundary}")
         append_line(f'Content-Disposition: form-data; name="{name}"')
         append_line()
-        append_line(str(value))
+        append_line(normalize_multipart_field_value(value))
 
     for name, source in files.items():
         if isinstance(source, tuple):
@@ -430,7 +483,83 @@ def send_message(token: str, payload: dict[str, object], opener, timeout: int = 
     return body
 
 
-def main(argv=None, stdin=None, stdout=None, stderr=None, stdin_is_tty=None, opener_factory=None) -> int:
+def emit_result(stdout, as_json: bool, payload: dict[str, object]) -> None:
+    if as_json:
+        stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def build_fallback_text(text: str, fallback_link: str, caption_text: str | None = None) -> str:
+    parts = []
+    if caption_text and caption_text.strip():
+        parts.append(caption_text)
+    if text.strip():
+        parts.append(text)
+    parts.append(fallback_link)
+    return "\n\n".join(parts)
+
+
+def build_media_payload(chat_id: str, args: argparse.Namespace, caption: str | None) -> dict[str, object]:
+    payload: dict[str, object] = {"chat_id": chat_id}
+    if caption:
+        payload["caption"] = caption
+    if args.html:
+        payload["parse_mode"] = "HTML"
+    elif args.markdownv2:
+        payload["parse_mode"] = "MarkdownV2"
+    if args.disable_web_preview:
+        payload["disable_web_page_preview"] = True
+    if args.silent:
+        payload["disable_notification"] = True
+    return payload
+
+
+def send_media(
+    token: str,
+    method: str,
+    source_field: str,
+    source: str,
+    payload: dict[str, object],
+    opener,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    path_exists=None,
+):
+    path_exists = Path.exists if path_exists is None else path_exists
+    source = normalize_media_source(source)
+    parsed = urlparse(source)
+    is_remote = parsed.scheme in {"http", "https"}
+    is_local_path = not is_remote and path_exists(Path(source))
+
+    if is_local_path:
+        request = build_multipart_request(token, method, payload, {source_field: source})
+    else:
+        request_payload = dict(payload)
+        request_payload[source_field] = source
+        request = build_json_request(token, method, request_payload)
+
+    with opener.open(request, timeout=timeout) as response:
+        raw_body = response.read()
+
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
+
+    if not body.get("ok"):
+        description = body.get("description", "unknown Telegram API error")
+        raise NotifyError(f"Telegram API error: {description}")
+    return body
+
+
+def main(
+    argv=None,
+    stdin=None,
+    stdout=None,
+    stderr=None,
+    stdin_is_tty=None,
+    opener_factory=None,
+    path_exists=None,
+    stat_fn=None,
+) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
@@ -439,14 +568,34 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, stdin_is_tty=None, ope
         stdin_is_tty = stdin.isatty()
     if opener_factory is None:
         opener_factory = build_http_opener
+    if path_exists is None:
+        path_exists = lambda path: Path(path).exists()
+    if stat_fn is None:
+        stat_fn = os.stat
 
     parser = build_parser()
 
     try:
         args = parser.parse_args(argv)
-        if args.photo or args.file or args.attach:
-            raise NotifyError("media delivery is not implemented yet")
-        message_text = resolve_message(args, stdin, stdin_is_tty=stdin_is_tty)
+        media_source = args.photo or args.file or args.attach
+        message_uses_stdin = args.message_parts == ["-"] or (
+            not args.message_parts
+            and not stdin_is_tty
+            and not (media_source and args.caption == "-")
+        )
+        caption_text = resolve_caption(
+            args,
+            stdin,
+            stdin_is_tty=stdin_is_tty,
+            message_uses_stdin=message_uses_stdin,
+        )
+        message_text = resolve_message(
+            args,
+            stdin,
+            stdin_is_tty=stdin_is_tty,
+            required=not media_source,
+            implicit_stdin=message_uses_stdin,
+        )
         parse_mode = "HTML" if args.html else "MarkdownV2" if args.markdownv2 else None
         quote_text = None
         if args.quote:
@@ -458,10 +607,140 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, stdin_is_tty=None, ope
             if quote_raw:
                 quote_text = format_quote_block(quote_raw.rstrip("\n"), parse_mode)
         text = build_text_body(args, message_text, quote_text)
+
+        if media_source:
+            media_kind = "photo" if args.photo else "document"
+            if args.attach:
+                media_kind = classify_media_source(media_source)
+            method = "sendPhoto" if media_kind == "photo" else "sendDocument"
+            ensure_local_media_path_exists(media_source, path_exists)
+
+            try:
+                parsed_source = urlparse(media_source)
+                if parsed_source.scheme not in {"http", "https"} and path_exists(media_source):
+                    ensure_local_media_size(media_source, media_kind, stat_fn=stat_fn)
+            except NotifyError:
+                if not args.fallback_link:
+                    raise
+                fallback_text = build_fallback_text(text, args.fallback_link, caption_text)
+                if args.dry_run:
+                    emit_result(
+                        stdout,
+                        args.json,
+                        {
+                            "ok": True,
+                            "method": "sendMessage",
+                            "sent": False,
+                            "fallback_sent": False,
+                        },
+                    )
+                    return 0
+
+                token, chat_id, proxy_url = resolve_runtime_settings()
+                opener = opener_factory(proxy_url)
+                fallback_chunks_sent = 0
+                for chunk in chunk_text_message(fallback_text):
+                    send_message(token, build_payload(chat_id, args, chunk), opener)
+                    fallback_chunks_sent += 1
+                emit_result(
+                    stdout,
+                    args.json,
+                    {
+                        "ok": True,
+                        "method": "sendMessage",
+                        "sent": True,
+                        "fallback_sent": True,
+                        "chunks_sent": fallback_chunks_sent,
+                    },
+                )
+                return 0
+
+            caption_chunks = chunk_caption_text(caption_text or text)
+            media_caption = caption_chunks[0] if caption_chunks and caption_chunks[0] else None
+            followup_chunks = caption_chunks[1:]
+            if caption_text is not None and text.strip():
+                followup_chunks.extend(chunk_text_message(text))
+
+            if args.dry_run:
+                emit_result(
+                    stdout,
+                    args.json,
+                    {
+                        "ok": True,
+                        "method": method,
+                        "sent": False,
+                        "media_sent": False,
+                        "followup_sent": False,
+                        "fallback_sent": False,
+                    },
+                )
+                return 0
+
+            token, chat_id, proxy_url = resolve_runtime_settings()
+            opener = opener_factory(proxy_url)
+            try:
+                send_media(
+                    token,
+                    method,
+                    "photo" if media_kind == "photo" else "document",
+                    media_source,
+                    build_media_payload(chat_id, args, media_caption),
+                    opener,
+                    path_exists=lambda path: path_exists(str(path)),
+                )
+            except (NotifyError, urllib.error.HTTPError, urllib.error.URLError):
+                if not args.fallback_link:
+                    raise
+                fallback_text = build_fallback_text(text, args.fallback_link, caption_text)
+                fallback_chunks_sent = 0
+                for chunk in chunk_text_message(fallback_text):
+                    send_message(token, build_payload(chat_id, args, chunk), opener)
+                    fallback_chunks_sent += 1
+                emit_result(
+                    stdout,
+                    args.json,
+                    {
+                        "ok": True,
+                        "method": "sendMessage",
+                        "sent": True,
+                        "fallback_sent": True,
+                        "chunks_sent": fallback_chunks_sent,
+                    },
+                )
+                return 0
+            for chunk in followup_chunks:
+                send_message(token, build_payload(chat_id, args, chunk), opener)
+            emit_result(
+                stdout,
+                args.json,
+                {
+                    "ok": True,
+                    "method": method,
+                    "sent": True,
+                    "media_sent": True,
+                    "followup_sent": bool(followup_chunks),
+                    "fallback_sent": False,
+                },
+            )
+            return 0
+
         token, chat_id, proxy_url = resolve_runtime_settings()
         opener = opener_factory(proxy_url)
+        chunks_sent = 0
         for chunk in chunk_text_message(text):
             send_message(token, build_payload(chat_id, args, chunk), opener)
+            chunks_sent += 1
+        emit_result(
+            stdout,
+            args.json,
+            {
+                "ok": True,
+                "method": "sendMessage",
+                "sent": True,
+                "chunks_sent": chunks_sent,
+                "fallback_sent": False,
+            },
+        )
         return 0
     except NotifyError as exc:
         print(f"notify: error: {exc}", file=stderr)

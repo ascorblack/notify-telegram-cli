@@ -13,11 +13,12 @@ Implemented so far:
 - proxy-aware Telegram delivery through local Xray HTTP proxy
 - long text chunking
 - quote-file support for text notifications
+- photo and document delivery with `--photo`, `--file`, and `--attach`
 - media source classification and local upload size guards
-- caption parsing helpers for upcoming media delivery
+- caption parsing, caption overflow follow-up messages, and stdin caption support
+- fallback-link delivery for oversized uploads and media send failures
+- machine-readable `--json` results for agent workflows
 - unit test coverage for the current behavior
-
-Media delivery (`--photo`, `--file`, `--attach`) is not fully wired yet. The CLI currently rejects those modes with a clear error until the remaining implementation tasks are completed.
 
 ## Repository Layout
 
@@ -72,6 +73,18 @@ Run the CLI directly from the repo:
 
 ```bash
 python3 notify_cli.py --help
+```
+
+Examples:
+
+```bash
+notify "deploy finished"
+notify --html "<b>Deploy done</b>"
+notify --photo screenshot.png --caption "UI after fix"
+notify --file logs.zip --title "Incident logs"
+notify --attach artifact.png --tag nightly --tag success
+notify --file huge.tar --fallback-link https://example.com/huge.tar
+notify --file file_id:ABC123... --caption "reuse Telegram-hosted file"
 ```
 
 ## GitHub Prep
