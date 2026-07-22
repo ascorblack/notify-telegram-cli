@@ -7,6 +7,8 @@ description: Use when an agent should proactively notify the user in Telegram ab
 
 Use `notify` when the user should hear about an important event without reading the full terminal session.
 
+The default mode is rich Markdown: write ordinary Markdown and Telegram renders tables, formulas, headings, lists, and collapsible blocks natively (`sendRichMessage`). No escaping is needed, and the per-message limit is about 16000 characters. Prefer this default for all notifications — structured Markdown reports read much better in Telegram than plain text.
+
 ## When to Use
 
 - Long-running work finished, failed, or needs attention.
@@ -36,15 +38,23 @@ notify --json '{
 
 ## Common Commands
 
-Plain text:
+Markdown (default, recommended):
 
 ```bash
 notify "Nightly run finished"
+notify "# Nightly report
+
+| suite | passed | failed |
+|-------|--------|--------|
+| api   | 120    | 0      |
+
+Details in \`/tmp/report.html\`."
 ```
 
-Formatted text:
+Legacy formatting modes (avoid unless specifically needed):
 
 ```bash
+notify --plain "no formatting at all"
 notify --html "<b>Deploy done</b>"
 notify --markdownv2 "*escaped* body"
 ```
@@ -99,7 +109,7 @@ Useful fields:
 - `silent`
 - `disable_web_preview`
 - `album`
-- `parse_mode`: `html` or `markdownv2`
+- `parse_mode`: `markdown` (default, rich Markdown), `html`, `markdownv2`, or `plain`
 - `event`: string or object
 - `meta`: object with arbitrary context
 - `media`: ordered array of items like `{"type":"photo|photo_id|file|file_id|attach","source":"..."}`
@@ -118,4 +128,5 @@ cat payload.json | notify --json -
 - For very large local files, use `--fallback-link`.
 - If a screenshot should render inline, use `--photo`, not `--file`.
 - If the caller needs machine-readable delivery status, add `--json-output`.
+- Write reports as Markdown (headings, tables, lists) — Telegram renders them natively in the default mode. If the server does not support Rich Messages, delivery automatically degrades to plain text (`degraded_to_plain: true` in `--json-output`).
 - If the caller is unsure the channel is healthy, run `notify --doctor --json-output` first.

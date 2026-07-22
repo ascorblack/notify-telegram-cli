@@ -379,7 +379,7 @@ class NotifyCliTests(unittest.TestCase):
         try:
             stderr = io.StringIO()
             exit_code = self.module.main(
-                ["--quote", quote_path, "hello"],
+                ["--plain", "--quote", quote_path, "hello"],
                 stdin=io.StringIO(""),
                 stdout=io.StringIO(),
                 stderr=stderr,
@@ -723,8 +723,9 @@ class NotifyCliTests(unittest.TestCase):
         )
 
         self.assertEqual(exit_code, 0)
+        self.assertIn("/sendRichMessage", dummy_opener.request.full_url)
         payload = json.loads(dummy_opener.request.data.decode("utf-8"))
-        self.assertEqual(payload["text"], "Deploy\n\nhello from json")
+        self.assertEqual(payload["rich_message"]["markdown"], "**Deploy**\n\nhello from json")
 
     def test_main_reads_json_aliases_event_and_meta(self):
         class DummyResponse:
@@ -762,11 +763,12 @@ class NotifyCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(dummy_opener.request.data.decode("utf-8"))
-        self.assertIn("Tags: nightly, success", payload["text"])
-        self.assertIn("Links: https://example.com/run/123", payload["text"])
-        self.assertIn("Event: deploy / nightly", payload["text"])
-        self.assertIn("ID: run-123", payload["text"])
-        self.assertIn("branch: main", payload["text"])
+        body = payload["rich_message"]["markdown"]
+        self.assertIn("Tags: nightly, success", body)
+        self.assertIn("Links: https://example.com/run/123", body)
+        self.assertIn("Event: deploy / nightly", body)
+        self.assertIn("ID: run-123", body)
+        self.assertIn("branch: main", body)
 
     def test_main_reads_media_from_json_input(self):
         stdout = io.StringIO()
@@ -1018,7 +1020,7 @@ class NotifyCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(dummy_opener.request.data.decode("utf-8"))
-        self.assertEqual(payload["text"], "-")
+        self.assertEqual(payload["rich_message"]["markdown"], "-")
 
     def test_main_treats_dash_caption_in_json_as_literal_text(self):
         stdout = io.StringIO()
@@ -1172,7 +1174,7 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(len(opener.requests), 3)
         self.assertIn("/botenv-token/sendPhoto", opener.requests[0].full_url)
         self.assertIn("/botenv-token/sendDocument", opener.requests[1].full_url)
-        self.assertIn("/botenv-token/sendMessage", opener.requests[2].full_url)
+        self.assertIn("/botenv-token/sendRichMessage", opener.requests[2].full_url)
 
     def test_main_does_not_send_fallback_after_partial_multi_send_failure(self):
         class DummyResponse:
@@ -1308,7 +1310,7 @@ class NotifyCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(len(opener.requests), 2)
         self.assertIn("/botenv-token/sendPhoto", opener.requests[0].full_url)
-        self.assertIn("/botenv-token/sendMessage", opener.requests[1].full_url)
+        self.assertIn("/botenv-token/sendRichMessage", opener.requests[1].full_url)
         self.assertIn("https://example.com/fallback", opener.requests[1].data.decode("utf-8"))
 
     def test_main_rejects_album_over_ten_items(self):
@@ -1388,7 +1390,7 @@ class NotifyCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(
-            json.loads(dummy_opener.request.data.decode("utf-8"))["text"],
+            json.loads(dummy_opener.request.data.decode("utf-8"))["rich_message"]["markdown"],
             "message from file\n",
         )
 
@@ -1537,7 +1539,7 @@ class NotifyCliTests(unittest.TestCase):
         result = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertTrue(result["fallback_sent"])
-        self.assertEqual(result["method"], "sendMessage")
+        self.assertEqual(result["method"], "sendRichMessage")
 
     def test_main_errors_for_missing_explicit_local_media_path(self):
         stderr = io.StringIO()
@@ -1677,10 +1679,10 @@ class NotifyCliTests(unittest.TestCase):
         result = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertTrue(result["fallback_sent"])
-        self.assertEqual(result["method"], "sendMessage")
+        self.assertEqual(result["method"], "sendRichMessage")
         self.assertEqual(len(opener.requests), 2)
         self.assertIn("/botenv-token/sendDocument", opener.requests[0].full_url)
-        self.assertIn("/botenv-token/sendMessage", opener.requests[1].full_url)
+        self.assertIn("/botenv-token/sendRichMessage", opener.requests[1].full_url)
         self.assertIn("https://example.com/logs.zip", opener.requests[1].data.decode("utf-8"))
 
     def test_main_preserves_caption_in_fallback_message(self):
@@ -1769,7 +1771,7 @@ class NotifyCliTests(unittest.TestCase):
 
         opener = DummyOpener()
         stdout = io.StringIO()
-        long_message = "x" * 5000
+        long_message = "x" * 20000
         old_env = os.environ.copy()
         with tempfile.NamedTemporaryFile("wb", suffix=".zip", delete=False) as artifact:
             artifact.write(b"ZIPDATA")
@@ -1802,15 +1804,16 @@ class NotifyCliTests(unittest.TestCase):
 
         result = json.loads(stdout.getvalue())
         send_message_requests = [
-            request for request in opener.requests if request.full_url.endswith("/sendMessage")
+            request for request in opener.requests if request.full_url.endswith("/sendRichMessage")
         ]
         payloads = [json.loads(request.data.decode("utf-8")) for request in send_message_requests]
+        texts = [payload["rich_message"]["markdown"] for payload in payloads]
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(result["fallback_sent"])
         self.assertGreater(len(send_message_requests), 1)
-        self.assertTrue(all(len(payload["text"]) <= 4096 for payload in payloads))
-        self.assertIn("https://example.com/huge.log", "".join(payload["text"] for payload in payloads))
+        self.assertTrue(all(len(text) <= self.module.TELEGRAM_RICH_MESSAGE_LIMIT for text in texts))
+        self.assertIn("https://example.com/huge.log", "".join(texts))
 
     def test_main_uses_env_overrides(self):
         class DummyResponse:
@@ -1858,8 +1861,253 @@ class NotifyCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
-        self.assertIn("/botenv-token/sendMessage", dummy_opener.request.full_url)
-        self.assertEqual(dummy_opener.request.data, b'{"chat_id":"999","text":"hello"}')
+        self.assertIn("/botenv-token/sendRichMessage", dummy_opener.request.full_url)
+        self.assertEqual(dummy_opener.request.data, b'{"chat_id":"999","rich_message":{"markdown":"hello"}}')
+
+
+class RichModeTests(unittest.TestCase):
+    def setUp(self):
+        self.module = notify_cli
+        self.parser = self.module.build_parser()
+
+    def parse(self, argv):
+        return self.parser.parse_args(argv)
+
+    def test_default_mode_is_rich_markdown(self):
+        self.assertEqual(self.module.resolve_mode(self.parse(["hello"])), "markdown")
+        self.assertEqual(self.module.resolve_mode(self.parse(["--plain", "hello"])), "plain")
+        self.assertEqual(self.module.resolve_mode(self.parse(["--html", "hello"])), "html")
+        self.assertEqual(self.module.resolve_mode(self.parse(["--markdownv2", "hello"])), "markdownv2")
+        self.assertEqual(self.module.resolve_mode(self.parse(["--markdown", "hello"])), "markdown")
+
+    def test_rich_and_legacy_flags_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            self.parse(["--markdown", "--html", "hello"])
+        with self.assertRaises(SystemExit):
+            self.parse(["--plain", "--markdownv2", "hello"])
+
+    def test_build_payload_wraps_markdown_in_rich_message(self):
+        args = self.parse(["| a | b |"])
+        payload = self.module.build_payload("123", args, "| a | b |", "markdown")
+        self.assertEqual(payload, {"chat_id": "123", "rich_message": {"markdown": "| a | b |"}})
+
+    def test_build_payload_uses_link_preview_options(self):
+        args = self.parse(["--disable-web-preview", "hello"])
+        rich = self.module.build_payload("123", args, "hello", "markdown")
+        plain = self.module.build_payload("123", args, "hello", "plain")
+        self.assertEqual(rich["link_preview_options"], {"is_disabled": True})
+        self.assertEqual(plain["link_preview_options"], {"is_disabled": True})
+        self.assertNotIn("disable_web_page_preview", rich)
+        self.assertNotIn("disable_web_page_preview", plain)
+
+    def test_json_parse_mode_accepts_markdown_and_rich(self):
+        for value in ("markdown", "rich", "Markdown", None):
+            self.assertEqual(self.module.normalize_parse_mode(value), "markdown")
+        self.assertEqual(self.module.normalize_parse_mode("plain"), "plain")
+        self.assertEqual(self.module.normalize_parse_mode("html"), "html")
+        self.assertEqual(self.module.normalize_parse_mode("markdownv2"), "markdownv2")
+
+    def test_build_text_body_escapes_header_for_legacy_modes(self):
+        args = self.parse(["--html", "--title", "<Deploy> & Co", "--tag", "a<b", "body"])
+        html_body = self.module.build_text_body(args, "body", None, "html")
+        self.assertIn("<b>&lt;Deploy&gt; &amp; Co</b>", html_body)
+        self.assertIn("Tags: a&lt;b", html_body)
+
+        args = self.parse(["--markdownv2", "--title", "v1.2!", "body"])
+        md2_body = self.module.build_text_body(args, "body", None, "markdownv2")
+        self.assertIn("*v1\\.2\\!*", md2_body)
+
+    def test_build_text_body_bold_title_in_markdown_mode(self):
+        args = self.parse(["--title", "Deploy", "body"])
+        body = self.module.build_text_body(args, "body", None, "markdown")
+        self.assertTrue(body.startswith("**Deploy**\n\n"))
+
+    def test_format_quote_block_uses_fenced_code_for_markdown_mode(self):
+        block = self.module.format_quote_block("line1\nline2", "markdown")
+        self.assertEqual(block, "```\nline1\nline2\n```")
+
+    def test_compute_upload_timeout_scales_with_size(self):
+        args = self.parse(["--timeout", "20", "hello"])
+        self.assertEqual(self.module.compute_upload_timeout(args, 0), 30)
+        self.assertGreater(self.module.compute_upload_timeout(args, 50 * 1024 * 1024), 700)
+        args = self.parse(["--timeout", "20", "--upload-timeout", "77", "hello"])
+        self.assertEqual(self.module.compute_upload_timeout(args, 50 * 1024 * 1024), 77)
+
+    def test_main_degrades_rich_to_plain_when_method_unsupported(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                if request.full_url.endswith("/sendRichMessage"):
+                    raise urllib.error.HTTPError(
+                        request.full_url, 404, "Not Found", hdrs=None, fp=io.BytesIO(b"")
+                    )
+                return DummyResponse(b'{"ok": true, "result": {"message_id": 1}}')
+
+        opener = DummyOpener()
+        stdout = io.StringIO()
+        old_env = os.environ.copy()
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            exit_code = self.module.main(
+                ["--json-output", "hello"],
+                stdin=io.StringIO(""),
+                stdout=stdout,
+                stderr=io.StringIO(),
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: opener,
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["degraded_to_plain"])
+        self.assertEqual(result["method"], "sendMessage")
+        self.assertIn("/sendRichMessage", opener.requests[0].full_url)
+        self.assertIn("/sendMessage", opener.requests[1].full_url)
+        self.assertEqual(
+            json.loads(opener.requests[1].data.decode("utf-8"))["text"], "hello"
+        )
+
+    def test_main_dry_run_prints_text_requests_without_json_output(self):
+        stdout = io.StringIO()
+        exit_code = self.module.main(
+            ["--dry-run", "# Report\n\n| a | b |"],
+            stdin=io.StringIO(""),
+            stdout=stdout,
+            stderr=io.StringIO(),
+            stdin_is_tty=True,
+            opener_factory=lambda proxy_url: self.fail("network should not be used"),
+        )
+
+        preview = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(preview["sent"])
+        self.assertEqual(preview["method"], "sendRichMessage")
+        self.assertEqual(len(preview["requests"]), 1)
+        self.assertEqual(
+            preview["requests"][0]["payload"]["rich_message"]["markdown"],
+            "# Report\n\n| a | b |",
+        )
+
+    def test_main_long_caption_followup_respects_message_limit(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                return DummyResponse(b'{"ok": true, "result": {"message_id": 1}}')
+
+        opener = DummyOpener()
+        old_env = os.environ.copy()
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as photo_file:
+            photo_file.write(b"PNGDATA")
+            photo_path = photo_file.name
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            exit_code = self.module.main(
+                ["--photo", photo_path, "--caption", "c" * 3000],
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: opener,
+            )
+        finally:
+            os.unlink(photo_path)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(opener.requests), 2)
+        self.assertIn("/sendPhoto", opener.requests[0].full_url)
+        self.assertIn("/sendRichMessage", opener.requests[1].full_url)
+        followup = json.loads(opener.requests[1].data.decode("utf-8"))
+        self.assertEqual(followup["rich_message"]["markdown"], "c" * (3000 - 1024))
+
+    def test_main_markdown_mode_does_not_stuff_text_into_caption(self):
+        class DummyResponse:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyOpener:
+            def __init__(self):
+                self.requests = []
+
+            def open(self, request, timeout=None):
+                self.requests.append(request)
+                return DummyResponse(b'{"ok": true, "result": {"message_id": 1}}')
+
+        opener = DummyOpener()
+        old_env = os.environ.copy()
+        with tempfile.NamedTemporaryFile("wb", suffix=".png", delete=False) as photo_file:
+            photo_file.write(b"PNGDATA")
+            photo_path = photo_file.name
+        try:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "env-token"
+            os.environ["TELEGRAM_CHAT_ID"] = "999"
+            exit_code = self.module.main(
+                ["--photo", photo_path, "short **md** body"],
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+                stderr=io.StringIO(),
+                stdin_is_tty=True,
+                opener_factory=lambda proxy_url: opener,
+            )
+        finally:
+            os.unlink(photo_path)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(opener.requests), 2)
+        self.assertNotIn(b'name="caption"', opener.requests[0].data)
+        self.assertIn("/sendRichMessage", opener.requests[1].full_url)
+        followup = json.loads(opener.requests[1].data.decode("utf-8"))
+        self.assertEqual(followup["rich_message"]["markdown"], "short **md** body")
 
 
 class InstallerAndSkillTests(unittest.TestCase):

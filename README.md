@@ -4,7 +4,9 @@ CLI tool for sending Telegram notifications through a bot, designed for autonomo
 
 ## What It Does
 
-- sends plain text, `HTML`, and `MarkdownV2` messages
+- sends Markdown messages by default via Telegram Rich Messages (`sendRichMessage`, Bot API 10.1+) with native rendering of tables, formulas, headings, and lists — no escaping needed
+- automatically degrades to plain text when the Bot API server does not support Rich Messages
+- also supports legacy `--plain`, `--html`, and `--markdownv2` modes
 - sends photos inline with `--photo`
 - sends files as documents with `--file`
 - supports `--attach`, `--photo-id`, `--file-id`, multi-send, and `--album`
@@ -110,6 +112,13 @@ Examples:
 
 ```bash
 notify "deploy finished"
+notify "# Nightly report
+
+| suite | passed | failed |
+|-------|--------|--------|
+| api   | 120    | 0      |
+| web   | 98     | 2      |"
+notify --plain "no formatting at all"
 notify --html "<b>Deploy done</b>"
 notify --json '{"title":"Deploy","message":"done"}'
 notify --json '{"message":"done","tags":["nightly","success"],"links":["https://example.com/run/123"],"event":{"type":"deploy","name":"nightly","status":"success","id":"run-123"},"meta":{"branch":"main","services":["api","worker"]}}'
@@ -142,12 +151,22 @@ Agent-friendly JSON fields:
 - `silent`
 - `disable_web_preview`
 - `album`
-- `parse_mode`: `html` or `markdownv2`
+- `parse_mode`: `markdown` (default, rich Markdown), `html`, `markdownv2`, or `plain`
 - `event`: string or object, for example `{"type":"deploy","name":"nightly","status":"success","id":"run-123"}`
 - `meta`: object with arbitrary context, for example `{"branch":"main","services":["api","worker"]}`
 - `media`: ordered array of items like `{"type":"photo|photo_id|file|file_id|attach","source":"..."}`
 
 `event` and `meta` are rendered into the outgoing Telegram text so autonomous agents can send richer structured context without hand-formatting prose.
+
+## Formatting Modes
+
+The default mode is rich Markdown: the message goes through `sendRichMessage` (Bot API 10.1+), so Telegram natively renders tables, math formulas, headings, nested lists, block quotes, and collapsible details blocks. Agents can pass ordinary Markdown as-is; the per-message limit in this mode is about 16000 characters instead of 4096.
+
+If the Bot API server does not support Rich Messages yet, the CLI automatically re-sends the message as plain text and reports `degraded_to_plain: true` in `--json-output`.
+
+Legacy modes: `--plain` (no formatting), `--html`, `--markdownv2` (requires manual escaping). In legacy modes `title`, tags, links, `event`, and `meta` are escaped automatically.
+
+`--dry-run` prints the planned API requests as JSON without sending anything and without requiring configured credentials.
 
 ## Doctor
 

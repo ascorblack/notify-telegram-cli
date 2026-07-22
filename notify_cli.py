@@ -25,6 +25,7 @@ FILE_ID_PREFIX = "file_id:"
 PHOTO_MAX_BYTES = 10 * 1024 * 1024
 DOCUMENT_MAX_BYTES = 50 * 1024 * 1024
 TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_RICH_MESSAGE_LIMIT = 16000
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_MEDIA_GROUP_LIMIT = 10
 HTML_QUOTE_OPEN = "<pre><code>"
@@ -102,15 +103,23 @@ def resolve_runtime_settings(config_path: Path | None = None) -> tuple[str, str,
 def build_parser() -> argparse.ArgumentParser:
     description = (
         "Send a Telegram message through your bot. By default the text is sent as "
-        "plain text without parse_mode."
+        "Markdown via Telegram Rich Messages (sendRichMessage) with native "
+        "rendering of tables, formulas, headings, and lists."
     )
     epilog = """Formatting modes:
-  Default:
+  Default (--markdown):
+    Rich Markdown via sendRichMessage. Write normal Markdown, no escaping
+    needed. Telegram natively renders tables, math formulas, headings,
+    nested lists, block quotes, and collapsible details blocks.
+    Message limit is about 16000 characters per message.
+    If the Bot API server does not support Rich Messages yet, the message
+    is automatically re-sent as plain text.
+
+  --plain:
     Plain text. Telegram will not parse formatting markup.
 
   --html:
-    Use Telegram HTML parse mode. Prefer this when you want readable formatting
-    without heavy escaping. Common tags include:
+    Legacy Telegram HTML parse mode. Common tags include:
       <b>bold</b>
       <i>italic</i>
       <u>underline</u>
@@ -120,8 +129,9 @@ def build_parser() -> argparse.ArgumentParser:
       <a href="https://example.com">link</a>
 
   --markdownv2:
-    Use Telegram MarkdownV2 parse mode. This is stricter and requires escaping
-    special characters like: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    Legacy Telegram MarkdownV2 parse mode. This is stricter and requires
+    escaping special characters like: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    Prefer the default rich Markdown mode instead.
 
 Input modes:
   notify "hello world"
@@ -146,7 +156,6 @@ Media modes:
   notify --file-id BQACAgIA... --message-file note.txt
   notify --attach artifact.png --tag nightly --tag success
   notify --file huge.tar --fallback-link https://example.com/huge.tar
-  notify --file file_id:ABC123... --caption "reuse Telegram-hosted file"
 
 Limits:
   Upload photo: 10 MB
@@ -158,6 +167,7 @@ Proxy:
   Requests go through the local Xray HTTP proxy by default:
     http://127.0.0.1:10809
   Override with TELEGRAM_PROXY_URL if needed.
+  Set TELEGRAM_PROXY_URL=none (or proxy_url "none" in config) to connect directly.
 
 Environment overrides:
   TELEGRAM_BOT_TOKEN   Override bot token
@@ -174,11 +184,21 @@ Local config:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--html", action="store_true", help="send message with Telegram HTML formatting")
+    group.add_argument(
+        "--markdown",
+        action="store_true",
+        help="send message as rich Markdown via sendRichMessage (default)",
+    )
+    group.add_argument(
+        "--plain",
+        action="store_true",
+        help="send message as plain text without any formatting",
+    )
+    group.add_argument("--html", action="store_true", help="send message with legacy Telegram HTML formatting")
     group.add_argument(
         "--markdownv2",
         action="store_true",
-        help="send message with Telegram MarkdownV2 formatting",
+        help="send message with legacy Telegram MarkdownV2 formatting",
     )
     parser.set_defaults(media_items=[])
     parser.set_defaults(event=None, meta=None)
@@ -219,6 +239,12 @@ Local config:
     parser.add_argument("--dry-run", action="store_true", help="print the request without sending")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRY_COUNT, help="retry count for temporary network/API failures")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="request timeout in seconds")
+    parser.add_argument(
+        "--upload-timeout",
+        type=int,
+        default=None,
+        help="timeout for media uploads in seconds; default scales with file size",
+    )
     parser.add_argument("--message-file", metavar="PATH", help="read message body from a local file")
     caption_group = parser.add_mutually_exclusive_group()
     caption_group.add_argument("--caption", help="media caption text; pass '-' to read from stdin")
@@ -280,19 +306,37 @@ def normalize_boolean(value: object, field_name: str) -> bool:
     )
 
 
-def normalize_parse_mode(value: object) -> tuple[bool, bool]:
+def normalize_parse_mode(value: object) -> str:
     if value is None:
-        return False, False
+        return "markdown"
     if not isinstance(value, str):
         raise NotifyError("json input field 'parse_mode' must be a string or null")
     normalized = value.strip().lower()
-    if normalized in {"", "plain", "plaintext", "none"}:
-        return False, False
+    if normalized in {"", "markdown", "rich"}:
+        return "markdown"
+    if normalized in {"plain", "plaintext", "none"}:
+        return "plain"
     if normalized == "html":
-        return True, False
+        return "html"
     if normalized == "markdownv2":
-        return False, True
-    raise NotifyError("json input field 'parse_mode' must be one of html, markdownv2, plain, none")
+        return "markdownv2"
+    raise NotifyError(
+        "json input field 'parse_mode' must be one of markdown, html, markdownv2, plain, none"
+    )
+
+
+def resolve_mode(args: argparse.Namespace) -> str:
+    if args.html:
+        return "html"
+    if args.markdownv2:
+        return "markdownv2"
+    if getattr(args, "plain", False):
+        return "plain"
+    return "markdown"
+
+
+def message_limit_for_mode(mode: str) -> int:
+    return TELEGRAM_RICH_MESSAGE_LIMIT if mode == "markdown" else TELEGRAM_MESSAGE_LIMIT
 
 
 def normalize_event_payload(value: object) -> dict[str, object] | None:
@@ -362,7 +406,11 @@ def apply_json_input(args: argparse.Namespace, payload: dict[str, object]) -> ar
     if "album" in payload:
         args.album = normalize_boolean(payload["album"], "album")
     if "parse_mode" in payload:
-        args.html, args.markdownv2 = normalize_parse_mode(payload["parse_mode"])
+        mode = normalize_parse_mode(payload["parse_mode"])
+        args.html = mode == "html"
+        args.markdownv2 = mode == "markdownv2"
+        args.plain = mode == "plain"
+        args.markdown = mode == "markdown"
     media_items = []
     if "media" in payload:
         media = payload["media"]
@@ -507,20 +555,35 @@ def resolve_caption(
     return caption
 
 
-def build_text_body(args: argparse.Namespace, message_text: str, quote_text: str | None) -> str:
+def format_title(title: str, mode: str) -> str:
+    if mode == "html":
+        return f"<b>{html_module.escape(title)}</b>"
+    if mode == "markdownv2":
+        return f"*{escape_markdown_v2(title)}*"
+    if mode == "markdown":
+        return f"**{title}**"
+    return title
+
+
+def build_text_body(
+    args: argparse.Namespace,
+    message_text: str,
+    quote_text: str | None,
+    mode: str = "plain",
+) -> str:
     parts = []
     if args.title:
-        parts.append(args.title)
+        parts.append(format_title(args.title, mode))
     event_text = build_event_block(getattr(args, "event", None))
     if event_text:
-        parts.append(event_text)
+        parts.append(escape_for_mode(event_text, mode))
     if args.tag:
-        parts.append(f"Tags: {', '.join(args.tag)}")
+        parts.append(escape_for_mode(f"Tags: {', '.join(args.tag)}", mode))
     if args.link:
-        parts.append(f"Links: {' '.join(args.link)}")
+        parts.append(escape_for_mode(f"Links: {' '.join(args.link)}", mode))
     meta_text = build_meta_block(getattr(args, "meta", None))
     if meta_text:
-        parts.append(meta_text)
+        parts.append(escape_for_mode(meta_text, mode))
     if quote_text:
         parts.append(quote_text)
     parts.append(message_text)
@@ -591,10 +654,6 @@ def chunk_text_message(text: str, max_length: int = TELEGRAM_MESSAGE_LIMIT) -> l
     return chunks or [""]
 
 
-def chunk_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    return chunk_text_message(text, max_length=limit)
-
-
 def chunk_caption_text(text: str, max_length: int = TELEGRAM_CAPTION_LIMIT) -> list[str]:
     if max_length <= 0:
         raise ValueError("limit must be positive")
@@ -603,36 +662,48 @@ def chunk_caption_text(text: str, max_length: int = TELEGRAM_CAPTION_LIMIT) -> l
     return [text[index : index + max_length] for index in range(0, len(text), max_length)] or [""]
 
 
-def format_quote_block(text: str, parse_mode=None) -> str:
-    if parse_mode in {"HTML", "html"} or parse_mode is True:
+MARKDOWN_V2_ESCAPES = {
+    "\\": "\\\\",
+    "_": "\\_",
+    "*": "\\*",
+    "[": "\\[",
+    "]": "\\]",
+    "(": "\\(",
+    ")": "\\)",
+    "~": "\\~",
+    "`": "\\`",
+    ">": "\\>",
+    "#": "\\#",
+    "+": "\\+",
+    "-": "\\-",
+    "=": "\\=",
+    "|": "\\|",
+    "{": "\\{",
+    "}": "\\}",
+    ".": "\\.",
+    "!": "\\!",
+}
+
+
+def escape_markdown_v2(text: str) -> str:
+    return "".join(MARKDOWN_V2_ESCAPES.get(char, char) for char in text)
+
+
+def escape_for_mode(text: str, mode: str) -> str:
+    if mode == "html":
+        return html_module.escape(text)
+    if mode == "markdownv2":
+        return escape_markdown_v2(text)
+    return text
+
+
+def format_quote_block(text: str, mode: str = "plain") -> str:
+    if mode in {"HTML", "html"} or mode is True:
         return f"{HTML_QUOTE_OPEN}{html_module.escape(text)}{HTML_QUOTE_CLOSE}"
-    if parse_mode in {"MarkdownV2", "markdownv2"}:
-        replacements = {
-            "\\": "\\\\",
-            "_": "\\_",
-            "*": "\\*",
-            "[": "\\[",
-            "]": "\\]",
-            "(": "\\(",
-            ")": "\\)",
-            "~": "\\~",
-            "`": "\\`",
-            ">": "\\>",
-            "#": "\\#",
-            "+": "\\+",
-            "-": "\\-",
-            "=": "\\=",
-            "|": "\\|",
-            "{": "\\{",
-            "}": "\\}",
-            ".": "\\.",
-            "!": "\\!",
-        }
-
-        def escape_markdown_v2(line: str) -> str:
-            return "".join(replacements.get(char, char) for char in line)
-
+    if mode in {"MarkdownV2", "markdownv2"}:
         return "\n".join(f"> {escape_markdown_v2(line)}" if line else ">" for line in text.splitlines())
+    if mode == "markdown":
+        return f"```\n{text}\n```"
     return "\n".join(f"> {line}" if line else ">" for line in text.splitlines())
 
 
@@ -702,23 +773,45 @@ def ensure_local_media_size(source: str, media_kind: str, stat_fn=os.stat) -> No
         raise NotifyError(f"{media_kind} upload exceeds {limit_mb} MB limit")
 
 
-def build_payload(chat_id: str, args: argparse.Namespace, text: str) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "chat_id": chat_id,
-        "text": text,
-    }
-    if args.html:
-        payload["parse_mode"] = "HTML"
-    elif args.markdownv2:
-        payload["parse_mode"] = "MarkdownV2"
+def build_payload(
+    chat_id: str,
+    args: argparse.Namespace,
+    text: str,
+    mode: str | None = None,
+) -> dict[str, object]:
+    mode = resolve_mode(args) if mode is None else mode
+    payload: dict[str, object] = {"chat_id": chat_id}
+    if mode == "markdown":
+        payload["rich_message"] = {"markdown": text}
+    else:
+        payload["text"] = text
+        if mode == "html":
+            payload["parse_mode"] = "HTML"
+        elif mode == "markdownv2":
+            payload["parse_mode"] = "MarkdownV2"
     if args.disable_web_preview:
-        payload["disable_web_page_preview"] = True
+        payload["link_preview_options"] = {"is_disabled": True}
     if args.silent:
         payload["disable_notification"] = True
     return payload
 
 
+def text_send_method_for_mode(mode: str) -> str:
+    return "sendRichMessage" if mode == "markdown" else "sendMessage"
+
+
+def is_rich_unsupported_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 404
+    if isinstance(exc, NotifyError):
+        description = str(exc).lower()
+        return "method not found" in description or "unknown method" in description
+    return False
+
+
 def build_http_opener(proxy_url: str):
+    if not proxy_url or proxy_url.strip().lower() in {"none", "direct"}:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
     proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     return urllib.request.build_opener(proxy_handler)
 
@@ -732,6 +825,18 @@ def build_json_request(token: str, method: str, payload: dict[str, object]) -> u
     )
 
 
+def parse_telegram_response(raw_body: bytes) -> dict[str, object]:
+    try:
+        body = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
+
+    if not body.get("ok"):
+        description = body.get("description", "unknown Telegram API error")
+        raise NotifyError(f"Telegram API error: {description}")
+    return body
+
+
 def call_telegram_json_method(
     token: str,
     method: str,
@@ -743,16 +848,7 @@ def call_telegram_json_method(
     request = build_json_request(token, method, payload)
     with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
         raw_body = response.read()
-
-    try:
-        body = json.loads(raw_body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
-
-    if not body.get("ok"):
-        description = body.get("description", "unknown Telegram API error")
-        raise NotifyError(f"Telegram API error: {description}")
-    return body
+    return parse_telegram_response(raw_body)
 
 
 def is_retryable_http_error(exc: urllib.error.HTTPError) -> bool:
@@ -784,10 +880,10 @@ def open_with_retry(opener, request, timeout: int, retries: int):
             time.sleep(compute_retry_delay(exc, attempt_index))
             attempts_remaining -= 1
             attempt_index += 1
-        except urllib.error.URLError:
+        except urllib.error.URLError as exc:
             if attempts_remaining <= 0:
                 raise
-            time.sleep(compute_retry_delay(urllib.error.URLError("retry"), attempt_index))
+            time.sleep(compute_retry_delay(exc, attempt_index))
             attempts_remaining -= 1
             attempt_index += 1
 
@@ -861,6 +957,55 @@ def send_message(
     )
 
 
+def send_text_body(
+    token: str,
+    chat_id: str,
+    args: argparse.Namespace,
+    mode: str,
+    text: str,
+    opener,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int = DEFAULT_RETRY_COUNT,
+) -> dict[str, object]:
+    """Send text in mode-sized chunks; degrade rich mode to plain when unsupported."""
+    chunks = chunk_text_message(text, max_length=message_limit_for_mode(mode))
+    method = text_send_method_for_mode(mode)
+    chunks_sent = 0
+    degraded = False
+    for chunk in chunks:
+        try:
+            call_telegram_json_method(
+                token,
+                method,
+                build_payload(chat_id, args, chunk, mode),
+                opener,
+                timeout=timeout,
+                retries=retries,
+            )
+        except (NotifyError, urllib.error.HTTPError) as exc:
+            if mode != "markdown" or chunks_sent > 0 or not is_rich_unsupported_error(exc):
+                raise
+            degraded = True
+            break
+        chunks_sent += 1
+
+    if degraded:
+        method = "sendMessage"
+        chunks_sent = 0
+        for chunk in chunk_text_message(text, max_length=TELEGRAM_MESSAGE_LIMIT):
+            call_telegram_json_method(
+                token,
+                method,
+                build_payload(chat_id, args, chunk, "plain"),
+                opener,
+                timeout=timeout,
+                retries=retries,
+            )
+            chunks_sent += 1
+
+    return {"method": method, "chunks_sent": chunks_sent, "degraded_to_plain": degraded}
+
+
 def emit_result(stdout, as_json: bool, payload: dict[str, object]) -> None:
     if as_json:
         stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -876,19 +1021,83 @@ def build_fallback_text(text: str, fallback_link: str, caption_text: str | None 
     return "\n\n".join(parts)
 
 
-def build_media_payload(chat_id: str, args: argparse.Namespace, caption: str | None) -> dict[str, object]:
+def build_media_payload(
+    chat_id: str,
+    args: argparse.Namespace,
+    caption: str | None,
+    mode: str | None = None,
+) -> dict[str, object]:
+    mode = resolve_mode(args) if mode is None else mode
     payload: dict[str, object] = {"chat_id": chat_id}
     if caption:
         payload["caption"] = caption
-    if args.html:
-        payload["parse_mode"] = "HTML"
-    elif args.markdownv2:
-        payload["parse_mode"] = "MarkdownV2"
-    if args.disable_web_preview:
-        payload["disable_web_page_preview"] = True
+        if mode == "html":
+            payload["parse_mode"] = "HTML"
+        elif mode == "markdownv2":
+            payload["parse_mode"] = "MarkdownV2"
     if args.silent:
         payload["disable_notification"] = True
     return payload
+
+
+def local_media_size(source: str, path_exists, stat_fn) -> int:
+    normalized = normalize_media_source(source)
+    parsed = urlparse(normalized)
+    if parsed.scheme in {"http", "https"} or not path_exists(normalized):
+        return 0
+    try:
+        return stat_fn(normalized).st_size
+    except OSError:
+        return 0
+
+
+def build_media_requests_preview(
+    args: argparse.Namespace,
+    mode: str,
+    media_inputs: list[dict[str, str]],
+    primary_caption: str | None,
+    followup_text: str,
+) -> list[dict[str, object]]:
+    requests: list[dict[str, object]] = []
+    if args.album:
+        media = []
+        for index, item in enumerate(media_inputs):
+            entry: dict[str, object] = {"type": "photo", "media": normalize_media_source(item["source"])}
+            if index == 0 and primary_caption:
+                entry["caption"] = primary_caption
+            media.append(entry)
+        requests.append(
+            {"method": "sendMediaGroup", "payload": {"chat_id": "<chat_id>", "media": media}}
+        )
+    else:
+        for index, item in enumerate(media_inputs):
+            media_kind = item["media_kind"]
+            payload = build_media_payload(
+                "<chat_id>", args, primary_caption if index == 0 else None, mode
+            )
+            payload["photo" if media_kind == "photo" else "document"] = normalize_media_source(item["source"])
+            requests.append(
+                {
+                    "method": "sendPhoto" if media_kind == "photo" else "sendDocument",
+                    "payload": payload,
+                }
+            )
+    if followup_text:
+        for chunk in chunk_text_message(followup_text, max_length=message_limit_for_mode(mode)):
+            requests.append(
+                {
+                    "method": text_send_method_for_mode(mode),
+                    "payload": build_payload("<chat_id>", args, chunk, mode),
+                }
+            )
+    return requests
+
+
+def compute_upload_timeout(args: argparse.Namespace, size_bytes: int) -> int:
+    if getattr(args, "upload_timeout", None):
+        return args.upload_timeout
+    # assume at least ~64 KiB/s through the proxy plus base timeout headroom
+    return max(args.timeout, 30 + size_bytes // (64 * 1024))
 
 
 def send_media(
@@ -917,16 +1126,7 @@ def send_media(
 
     with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
         raw_body = response.read()
-
-    try:
-        body = json.loads(raw_body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
-
-    if not body.get("ok"):
-        description = body.get("description", "unknown Telegram API error")
-        raise NotifyError(f"Telegram API error: {description}")
-    return body
+    return parse_telegram_response(raw_body)
 
 
 def build_media_group_request(
@@ -981,16 +1181,7 @@ def send_media_group(
     request = build_media_group_request(token, chat_id, args, media_sources, caption, path_exists=path_exists)
     with open_with_retry(opener, request, timeout=timeout, retries=retries) as response:
         raw_body = response.read()
-
-    try:
-        body = json.loads(raw_body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise NotifyError(f"Telegram API returned invalid JSON: {raw_body!r}") from exc
-
-    if not body.get("ok"):
-        description = body.get("description", "unknown Telegram API error")
-        raise NotifyError(f"Telegram API error: {description}")
-    return body
+    return parse_telegram_response(raw_body)
 
 
 def inspect_runtime_settings(config_path: Path | None = None) -> dict[str, object]:
@@ -1219,7 +1410,15 @@ def validate_doctor_args(args: argparse.Namespace) -> None:
         raise NotifyError("--doctor cannot be combined with title, tag, or link flags")
     if args.fallback_link or args.quote:
         raise NotifyError("--doctor cannot be combined with fallback or quote flags")
-    if args.html or args.markdownv2 or args.album or args.silent or args.disable_web_preview:
+    if (
+        args.html
+        or args.markdownv2
+        or args.markdown
+        or args.plain
+        or args.album
+        or args.silent
+        or args.disable_web_preview
+    ):
         raise NotifyError("--doctor cannot be combined with formatting or delivery flags")
     if args.dry_run:
         raise NotifyError("--doctor cannot be combined with --dry-run")
@@ -1289,13 +1488,13 @@ def main(
             required=not media_source,
             implicit_stdin=message_uses_stdin,
         )
-        parse_mode = "HTML" if args.html else "MarkdownV2" if args.markdownv2 else None
+        mode = resolve_mode(args)
         quote_text = None
         if args.quote:
             quote_raw = read_text_file(args.quote, "quote file")
             if quote_raw:
-                quote_text = format_quote_block(quote_raw.rstrip("\n"), parse_mode)
-        text = build_text_body(args, message_text, quote_text)
+                quote_text = format_quote_block(quote_raw.rstrip("\n"), mode)
+        text = build_text_body(args, message_text, quote_text, mode)
 
         if media_inputs:
             if args.album:
@@ -1313,7 +1512,7 @@ def main(
                         args.json_output,
                         {
                             "ok": True,
-                            "method": "sendMessage",
+                            "method": text_send_method_for_mode(mode),
                             "sent": False,
                             "fallback_sent": False,
                         },
@@ -1322,25 +1521,26 @@ def main(
 
                 token, chat_id, proxy_url = resolve_runtime_settings()
                 actual_opener = opener or opener_factory(proxy_url)
-                fallback_chunks_sent = 0
-                for chunk in chunk_text_message(fallback_text):
-                    send_message(
-                        token,
-                        build_payload(chat_id, args, chunk),
-                        actual_opener,
-                        timeout=args.timeout,
-                        retries=args.retries,
-                    )
-                    fallback_chunks_sent += 1
+                outcome = send_text_body(
+                    token,
+                    chat_id,
+                    args,
+                    mode,
+                    fallback_text,
+                    actual_opener,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                )
                 emit_result(
                     stdout,
                     args.json_output,
                     {
                         "ok": True,
-                        "method": "sendMessage",
+                        "method": outcome["method"],
                         "sent": True,
                         "fallback_sent": True,
-                        "chunks_sent": fallback_chunks_sent,
+                        "chunks_sent": outcome["chunks_sent"],
+                        "degraded_to_plain": outcome["degraded_to_plain"],
                     },
                 )
                 return 0
@@ -1359,30 +1559,52 @@ def main(
                     raise
                 return send_fallback()
 
-            caption_chunks = chunk_caption_text(caption_text or text)
-            primary_caption = caption_chunks[0] if caption_chunks and caption_chunks[0] else None
-            followup_chunks = caption_chunks[1:]
-            if caption_text is not None and text.strip():
-                followup_chunks.extend(chunk_text_message(text))
+            followup_parts: list[str] = []
+            if caption_text is not None:
+                caption_chunks = chunk_caption_text(caption_text)
+                primary_caption = caption_chunks[0] or None
+                caption_rest = "".join(caption_chunks[1:])
+                if caption_rest:
+                    followup_parts.append(caption_rest)
+                if text.strip():
+                    followup_parts.append(text)
+            elif text.strip() and mode != "markdown" and len(text) <= TELEGRAM_CAPTION_LIMIT:
+                primary_caption = text
+            else:
+                primary_caption = None
+                if text.strip():
+                    followup_parts.append(text)
+            followup_text = "\n\n".join(followup_parts)
+
+            if args.album:
+                media_methods = ["sendMediaGroup"]
+            else:
+                media_methods = [
+                    "sendPhoto" if item["media_kind"] == "photo" else "sendDocument"
+                    for item in media_inputs
+                ]
+            result_method = (
+                media_methods[0] if args.album or len(media_inputs) == 1 else "sendMedia"
+            )
 
             if args.dry_run:
-                method = "sendMediaGroup" if args.album else (
-                    "sendSequence" if len(media_inputs) > 1 else (
-                        "sendPhoto" if media_inputs[0]["media_kind"] == "photo" else "sendDocument"
-                    )
+                requests_preview = build_media_requests_preview(
+                    args, mode, media_inputs, primary_caption, followup_text
                 )
-                emit_result(
-                    stdout,
-                    args.json_output,
-                    {
-                        "ok": True,
-                        "method": method,
-                        "sent": False,
-                        "media_sent": False,
-                        "followup_sent": False,
-                        "fallback_sent": False,
-                    },
-                )
+                result = {
+                    "ok": True,
+                    "method": result_method,
+                    "methods": media_methods,
+                    "sent": False,
+                    "media_sent": False,
+                    "followup_sent": False,
+                    "fallback_sent": False,
+                    "requests": requests_preview,
+                }
+                if args.json_output:
+                    emit_result(stdout, True, result)
+                else:
+                    stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
                 return 0
 
             token, chat_id, proxy_url = resolve_runtime_settings()
@@ -1390,6 +1612,10 @@ def main(
             media_sent_count = 0
             try:
                 if args.album:
+                    group_size = sum(
+                        local_media_size(item["source"], path_exists, stat_fn)
+                        for item in media_inputs
+                    )
                     send_media_group(
                         token,
                         chat_id,
@@ -1397,7 +1623,7 @@ def main(
                         [item["source"] for item in media_inputs],
                         primary_caption,
                         opener,
-                        timeout=args.timeout,
+                        timeout=compute_upload_timeout(args, group_size),
                         retries=args.retries,
                         path_exists=lambda path: path_exists(str(path)),
                     )
@@ -1405,14 +1631,15 @@ def main(
                 else:
                     for index, item in enumerate(media_inputs):
                         media_kind = item["media_kind"]
+                        item_size = local_media_size(item["source"], path_exists, stat_fn)
                         send_media(
                             token,
                             "sendPhoto" if media_kind == "photo" else "sendDocument",
                             "photo" if media_kind == "photo" else "document",
                             item["source"],
-                            build_media_payload(chat_id, args, primary_caption if index == 0 else None),
+                            build_media_payload(chat_id, args, primary_caption if index == 0 else None, mode),
                             opener,
-                            timeout=args.timeout,
+                            timeout=compute_upload_timeout(args, item_size),
                             retries=args.retries,
                             path_exists=lambda path: path_exists(str(path)),
                         )
@@ -1421,52 +1648,80 @@ def main(
                 if not args.fallback_link or media_sent_count > 0:
                     raise
                 return send_fallback(opener=opener)
-            for chunk in followup_chunks:
-                send_message(
+            degraded_to_plain = False
+            followup_chunks_sent = 0
+            if followup_text:
+                outcome = send_text_body(
                     token,
-                    build_payload(chat_id, args, chunk),
+                    chat_id,
+                    args,
+                    mode,
+                    followup_text,
                     opener,
                     timeout=args.timeout,
                     retries=args.retries,
                 )
+                degraded_to_plain = outcome["degraded_to_plain"]
+                followup_chunks_sent = outcome["chunks_sent"]
             emit_result(
                 stdout,
                 args.json_output,
                 {
                     "ok": True,
-                    "method": "sendMediaGroup" if args.album else (
-                        "sendSequence" if len(media_inputs) > 1 else (
-                            "sendPhoto" if media_inputs[0]["media_kind"] == "photo" else "sendDocument"
-                        )
-                    ),
+                    "method": result_method,
+                    "methods": media_methods,
                     "sent": True,
                     "media_sent": True,
-                    "followup_sent": bool(followup_chunks),
+                    "followup_sent": bool(followup_text),
+                    "followup_chunks_sent": followup_chunks_sent,
+                    "degraded_to_plain": degraded_to_plain,
                     "fallback_sent": False,
                 },
             )
             return 0
 
+        if args.dry_run:
+            requests_preview = [
+                {
+                    "method": text_send_method_for_mode(mode),
+                    "payload": build_payload("<chat_id>", args, chunk, mode),
+                }
+                for chunk in chunk_text_message(text, max_length=message_limit_for_mode(mode))
+            ]
+            result = {
+                "ok": True,
+                "method": text_send_method_for_mode(mode),
+                "sent": False,
+                "fallback_sent": False,
+                "requests": requests_preview,
+            }
+            if args.json_output:
+                emit_result(stdout, True, result)
+            else:
+                stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+            return 0
+
         token, chat_id, proxy_url = resolve_runtime_settings()
         opener = opener_factory(proxy_url)
-        chunks_sent = 0
-        for chunk in chunk_text_message(text):
-            send_message(
-                token,
-                build_payload(chat_id, args, chunk),
-                opener,
-                timeout=args.timeout,
-                retries=args.retries,
-            )
-            chunks_sent += 1
+        outcome = send_text_body(
+            token,
+            chat_id,
+            args,
+            mode,
+            text,
+            opener,
+            timeout=args.timeout,
+            retries=args.retries,
+        )
         emit_result(
             stdout,
             args.json_output,
             {
                 "ok": True,
-                "method": "sendMessage",
+                "method": outcome["method"],
                 "sent": True,
-                "chunks_sent": chunks_sent,
+                "chunks_sent": outcome["chunks_sent"],
+                "degraded_to_plain": outcome["degraded_to_plain"],
                 "fallback_sent": False,
             },
         )
