@@ -8,6 +8,7 @@ import html as html_module
 import mimetypes
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -773,6 +774,371 @@ def ensure_local_media_size(source: str, media_kind: str, stat_fn=os.stat) -> No
         raise NotifyError(f"{media_kind} upload exceeds {limit_mb} MB limit")
 
 
+# ---------------------------------------------------------------------------
+# Illustrated articles: Markdown with images placed WHERE THEY BELONG
+# ---------------------------------------------------------------------------
+#
+# `sendRichMessage` renders a list of typed blocks, not one Markdown string, and
+# that is what makes an image mid-article possible. The block schema is not in
+# the public reference at the time of writing; it was read back off the live API,
+# which echoes the stored blocks in its response. Sending `{"markdown": "..."}`
+# and reading the echo makes Telegram document its own format:
+#
+#     {"type": "heading",    "text": <inline>, "size": 1..6}
+#     {"type": "paragraph",  "text": <inline>}
+#     {"type": "blockquote", "blocks": [...]}
+#     {"type": "pre",        "text": "...", "language": "python"}
+#     {"type": "divider"}
+#     {"type": "list",  "items": [{"label": "•", "blocks": [...]}]}
+#            ordered items additionally carry {"type": "1", "value": n}
+#     {"type": "table", "cells": [[{"text": ..., "is_header": true,
+#                                   "align": "center", "valign": "middle"}]],
+#                       "is_bordered": true, "is_striped": true}
+#     {"type": "photo", "photo": {"type": "photo", "media": "attach://k0"},
+#                       "caption": {"text": <inline>}}
+#     {"type": "collage", "blocks": [<photo>, <photo>]}
+#
+# <inline> is either a bare string or a list mixing strings with entity objects:
+#     {"type": "bold"|"italic"|"code"|"strikethrough", "text": "..."}
+#     {"type": "url", "text": "...", "url": "https://..."}
+#
+# There is NO block that accepts Markdown. A `text` string is rendered verbatim,
+# so `**bold**` reaches the reader as four literal asterisks, and an unknown key
+# such as `content` is dropped in silence — a block whose text lands under one
+# is delivered EMPTY, with `ok: true` and no warning. That is why the Markdown
+# below is compiled into typed blocks here rather than handed over as a string.
+#
+# Local files ride along as multipart parts named by the `attach://` key. So an
+# author writes ordinary Markdown — `![caption](chart.png)` — and gets the image
+# in the right place instead of bolted on at the end. Consecutive images with no
+# prose between them become one collage, which is what a reader expects from a
+# row of related charts.
+
+IMAGE_LINE = re.compile(r'^\s*!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)(?:\s+"[^"]*")?\)\s*$')
+HEADING_LINE = re.compile(r'^(?P<hashes>#{1,6})\s+(?P<text>.*?)\s*#*\s*$')
+BULLET_LINE = re.compile(r'^\s*[-*+]\s+(?P<text>.*)$')
+ORDERED_LINE = re.compile(r'^\s*(?P<n>\d+)[.)]\s+(?P<text>.*)$')
+QUOTE_LINE = re.compile(r'^\s*>\s?(?P<text>.*)$')
+DIVIDER_LINE = re.compile(r'^\s*(?:-{3,}|\*{3,}|_{3,})\s*$')
+FENCE_LINE = re.compile(r'^\s*(?:```|~~~)\s*(?P<lang>[\w+-]*)\s*$')
+TABLE_ROW = re.compile(r'^\s*\|.*\|\s*$')
+TABLE_RULE = re.compile(r'^\s*\|(?:\s*:?-{2,}:?\s*\|)+\s*$')
+
+# Inline runs, longest delimiter first so `**` never matches as two `*`.
+INLINE_TOKEN = re.compile(
+    r'(?P<code>`+)(?P<code_text>.+?)(?P=code)'
+    r'|(?P<bold>\*\*|__)(?P<bold_text>.+?)(?P=bold)'
+    r'|(?P<strike>~~)(?P<strike_text>.+?)(?P=strike)'
+    r'|(?<![\w*])(?P<ital>[*_])(?P<ital_text>[^\s].*?)(?P=ital)(?![\w*])'
+    r'|\[(?P<link_text>[^\]]*)\]\((?P<link_url>[^)\s]+)(?:\s+"[^"]*")?\)',
+    re.DOTALL)
+
+
+# Telegram auto-links a bare token whose last label is a registered TLD -- it
+# links `файл.py`, because `.py` is Paraguay, but leaves `3.10.8` and
+# `some.thing` alone. Shipping the full IANA list to reproduce that exactly is
+# not worth it, so this covers schemes, `www.`, and the common TLDs; anything
+# rarer should be written as an explicit [text](url) link.
+BARE_URL = re.compile(
+    r'(?<![\w@/.])('
+    r'(?:https?://|www\.)[^\s<>()\[\]]+'
+    r'|[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|ru|io|dev|ai|app|co|edu|gov|info|me'
+    r'|xyz|tech|site|online|cloud|sh|so|to|tv|us|uk|de|fr|nl|eu|com\.ru)'
+    r'(?:/[^\s<>()\[\]]*)?'
+    r')(?<![.,;:!?])', re.IGNORECASE)
+
+
+def _autolink(chunk: str) -> list[object]:
+    """Plain prose -> that prose with bare URLs promoted to url entities."""
+    out: list[object] = []
+    pos = 0
+    for m in BARE_URL.finditer(chunk):
+        if m.start() > pos:
+            out.append(chunk[pos:m.start()])
+        out.append({"type": "url", "text": m.group(1), "url": m.group(1)})
+        pos = m.end()
+    if pos < len(chunk):
+        out.append(chunk[pos:])
+    return out
+
+
+def compile_inline(text: str) -> object:
+    """Markdown inline runs -> Telegram's `text` value.
+
+    Telegram stores unstyled prose as a bare string and a lone run as the entity
+    object itself, reserving the list form for genuinely mixed content. This
+    mirrors that, so output is identical to what its own Markdown parser writes.
+    """
+    parts: list[object] = []
+    pos = 0
+    for m in INLINE_TOKEN.finditer(text):
+        if m.start() > pos:
+            parts.extend(_autolink(text[pos:m.start()]))
+        if m.group("code") is not None:
+            parts.append({"type": "code", "text": m.group("code_text")})
+        elif m.group("bold") is not None:
+            parts.append({"type": "bold", "text": m.group("bold_text")})
+        elif m.group("strike") is not None:
+            parts.append({"type": "strikethrough", "text": m.group("strike_text")})
+        elif m.group("ital") is not None:
+            parts.append({"type": "italic", "text": m.group("ital_text")})
+        else:
+            parts.append({"type": "url", "text": m.group("link_text"),
+                          "url": m.group("link_url")})
+        pos = m.end()
+    if pos < len(text):
+        parts.extend(_autolink(text[pos:]))
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return parts
+
+
+def _nested_inline(parts: list[object]) -> object:
+    """Bold inside a run is not recursed into; entity text stays flat."""
+    return parts[0] if len(parts) == 1 and isinstance(parts[0], str) else parts
+
+
+def compile_markdown_blocks(text: str) -> list[dict[str, object]]:
+    """Markdown -> Telegram rich blocks, matching what its own parser produces."""
+    lines = text.splitlines()
+    blocks: list[dict[str, object]] = []
+    para: list[str] = []
+    i = 0
+
+    def flush_para() -> None:
+        body = " ".join(s.strip() for s in para if s.strip())
+        para.clear()
+        if body:
+            blocks.append({"type": "paragraph", "text": compile_inline(body)})
+
+    def list_item(raw: str) -> list[dict[str, object]]:
+        return [{"type": "paragraph", "text": compile_inline(raw.strip())}]
+
+    while i < len(lines):
+        line = lines[i]
+
+        if not line.strip():
+            flush_para()
+            i += 1
+            continue
+
+        fence = FENCE_LINE.match(line)
+        if fence:
+            flush_para()
+            body: list[str] = []
+            i += 1
+            while i < len(lines) and not FENCE_LINE.match(lines[i]):
+                body.append(lines[i])
+                i += 1
+            i += 1
+            block: dict[str, object] = {"type": "pre", "text": "\n".join(body).strip("\n")}
+            if fence.group("lang"):
+                block["language"] = fence.group("lang")
+            blocks.append(block)
+            continue
+
+        if DIVIDER_LINE.match(line):
+            flush_para()
+            blocks.append({"type": "divider"})
+            i += 1
+            continue
+
+        heading = HEADING_LINE.match(line)
+        if heading:
+            flush_para()
+            blocks.append({"type": "heading",
+                           "text": compile_inline(heading.group("text")),
+                           "size": len(heading.group("hashes"))})
+            i += 1
+            continue
+
+        if TABLE_ROW.match(line):
+            flush_para()
+            rows: list[str] = []
+            while i < len(lines) and TABLE_ROW.match(lines[i]):
+                rows.append(lines[i])
+                i += 1
+            blocks.append(_compile_table(rows))
+            continue
+
+        if QUOTE_LINE.match(line):
+            flush_para()
+            quoted: list[str] = []
+            while i < len(lines) and (QUOTE_LINE.match(lines[i]) or
+                                      (quoted and lines[i].strip())):
+                hit = QUOTE_LINE.match(lines[i])
+                quoted.append(hit.group("text") if hit else lines[i])
+                i += 1
+            blocks.append({"type": "blockquote",
+                           "blocks": compile_markdown_blocks("\n".join(quoted))})
+            continue
+
+        if BULLET_LINE.match(line) or ORDERED_LINE.match(line):
+            flush_para()
+            items: list[dict[str, object]] = []
+            while i < len(lines):
+                bullet = BULLET_LINE.match(lines[i])
+                ordered = ORDERED_LINE.match(lines[i])
+                if bullet:
+                    items.append({"label": "•",
+                                  "blocks": list_item(bullet.group("text"))})
+                elif ordered:
+                    n = int(ordered.group("n"))
+                    items.append({"label": f"{n}.",
+                                  "blocks": list_item(ordered.group("text")),
+                                  "type": "1", "value": n})
+                else:
+                    break
+                i += 1
+            blocks.append({"type": "list", "items": items})
+            continue
+
+        para.append(line)
+        i += 1
+
+    flush_para()
+    return blocks
+
+
+def _compile_table(rows: list[str]) -> dict[str, object]:
+    def cells_of(row: str) -> list[str]:
+        return [c.strip() for c in row.strip().strip("|").split("|")]
+
+    body = [r for r in rows if not TABLE_RULE.match(r)]
+    has_header = len(body) < len(rows)
+    cells: list[list[dict[str, object]]] = []
+    for index, row in enumerate(body):
+        header = has_header and index == 0
+        cells.append([{"text": compile_inline(value),
+                       **({"is_header": True} if header else {}),
+                       "align": "center" if header else "left",
+                       "valign": "middle"}
+                      for value in cells_of(row)])
+    return {"type": "table", "cells": cells,
+            "is_bordered": True, "is_striped": True}
+
+
+def _is_remote(src: str) -> bool:
+    return src.startswith(("http://", "https://"))
+
+
+def split_markdown_into_rich_blocks(
+    text: str,
+) -> tuple[list[dict[str, object]], dict[str, Path]]:
+    """Markdown -> (rich blocks, files to upload keyed by their attach name).
+
+    Image lines become photo blocks in place; a run of them with no prose between
+    becomes one collage. Everything else stays Markdown and keeps Telegram's
+    native rendering of tables, headings and lists.
+    """
+    blocks: list[dict[str, object]] = []
+    uploads: dict[str, Path] = {}
+    prose: list[str] = []
+    pending: list[tuple[str, str]] = []
+
+    def flush_prose() -> None:
+        body = "\n".join(prose).strip()
+        prose.clear()
+        if body:
+            blocks.extend(compile_markdown_blocks(body))
+
+    def media_for(src: str) -> dict[str, str]:
+        if _is_remote(src):
+            return {"type": "photo", "media": src}
+        path = Path(src).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"image not found: {src}")
+        key = f"img{len(uploads)}"
+        uploads[key] = path
+        return {"type": "photo", "media": f"attach://{key}"}
+
+    def flush_images() -> None:
+        if not pending:
+            return
+        if len(pending) == 1:
+            alt, src = pending[0]
+            photo: dict[str, object] = {"type": "photo", "photo": media_for(src)}
+            if alt.strip():
+                photo["caption"] = {"text": compile_inline(alt.strip())}
+            blocks.append(photo)
+        else:
+            # A collage is a CONTAINER of photo blocks, not a list of media --
+            # `photos` parses and then renders nothing, which the API reports
+            # only as RICH_MESSAGE_EMPTY.
+            blocks.append({"type": "collage",
+                           "blocks": [{"type": "photo", "photo": media_for(src)}
+                                      for _alt, src in pending]})
+        pending.clear()
+
+    for line in text.splitlines():
+        hit = IMAGE_LINE.match(line)
+        if hit:
+            flush_prose()
+            pending.append((hit.group("alt"), hit.group("src")))
+            continue
+        if pending and line.strip():
+            flush_images()
+        if not pending:
+            prose.append(line)
+    flush_images()
+    flush_prose()
+    return blocks, uploads
+
+
+def count_empty_blocks(blocks: object) -> int:
+    """Blocks Telegram stored with no text at all, counted recursively.
+
+    A photo or divider carries no text by nature and is never counted; a
+    paragraph, heading or table cell that came back blank means its content was
+    silently discarded on the way in.
+    """
+    if not isinstance(blocks, list):
+        return 0
+    empty = 0
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind in {"photo", "divider", "collage", "video", "animation"}:
+            empty += count_empty_blocks(block.get("blocks"))
+            continue
+        if kind in {"blockquote", "list"}:
+            empty += count_empty_blocks(block.get("blocks"))
+            for item in block.get("items") or []:
+                if isinstance(item, dict):
+                    empty += count_empty_blocks(item.get("blocks"))
+            continue
+        if kind == "table":
+            cells = [c for row in block.get("cells") or [] for c in row]
+            if cells and all(not (c or {}).get("text") for c in cells):
+                empty += 1
+            continue
+        if not block.get("text"):
+            empty += 1
+    return empty
+
+
+def markdown_has_images(text: str) -> bool:
+    return any(IMAGE_LINE.match(line) for line in text.splitlines())
+
+
+def build_rich_article_request(
+    token: str, chat_id: str, args: argparse.Namespace, text: str
+) -> tuple[str, dict[str, str], dict[str, Path]]:
+    """A multipart sendRichMessage carrying the article and its images."""
+    blocks, uploads = split_markdown_into_rich_blocks(text)
+    rich: dict[str, object] = {"blocks": blocks}
+    fields: dict[str, str] = {"chat_id": chat_id,
+                              "rich_message": json.dumps(rich, ensure_ascii=False)}
+    if getattr(args, "silent", False):
+        fields["disable_notification"] = "true"
+    if getattr(args, "disable_web_preview", False):
+        fields["link_preview_options"] = json.dumps({"is_disabled": True})
+    return "sendRichMessage", fields, uploads
+
+
 def build_payload(
     chat_id: str,
     args: argparse.Namespace,
@@ -968,6 +1334,33 @@ def send_text_body(
     retries: int = DEFAULT_RETRY_COUNT,
 ) -> dict[str, object]:
     """Send text in mode-sized chunks; degrade rich mode to plain when unsupported."""
+    # An article that places its own images is sent as one rich message of typed
+    # blocks rather than a Markdown string, so the pictures land where the author
+    # put them instead of trailing the text. Chunking is skipped deliberately:
+    # splitting would separate an image from the paragraph it illustrates.
+    if mode == "markdown" and markdown_has_images(text):
+        method, fields, uploads = build_rich_article_request(token, chat_id, args, text)
+        request = build_multipart_request(token, method, fields,
+                                          {k: v for k, v in uploads.items()})
+        with opener.open(request, timeout=max(timeout, 120)) as response:
+            payload = json.load(response)
+        if not payload.get("ok"):
+            raise NotifyError(str(payload.get("description") or "sendRichMessage failed"))
+        sent = json.loads(fields["rich_message"])["blocks"]
+        stored = ((payload.get("result") or {}).get("rich_message") or {}).get("blocks")
+        empty = count_empty_blocks(stored) if stored is not None else 0
+        if empty:
+            # Telegram drops keys it does not recognise WITHOUT complaining, so a
+            # block whose text landed under the wrong one is delivered blank
+            # behind an `ok: true`. Reading the echo is the only way to catch it.
+            raise NotifyError(
+                f"Telegram stored {empty} of {len(sent)} blocks empty — the message "
+                f"was delivered without its text. This means a block key was not "
+                f"accepted; compare the echoed blocks against the schema.")
+        return {"method": method, "chunks_sent": 1, "degraded_to_plain": False,
+                "blocks": len(sent), "blocks_stored": len(stored or []),
+                "images": len(uploads)}
+
     chunks = chunk_text_message(text, max_length=message_limit_for_mode(mode))
     method = text_send_method_for_mode(mode)
     chunks_sent = 0

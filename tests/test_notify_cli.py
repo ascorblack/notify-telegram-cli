@@ -2214,5 +2214,105 @@ class InstallerAndSkillTests(unittest.TestCase):
         )
 
 
+class MarkdownBlockCompilerTests(unittest.TestCase):
+    """The block schema is Telegram's, verified by reading back what it stores.
+
+    Telegram accepts unknown keys in silence, so a block built the wrong way is
+    delivered EMPTY behind an `ok: true`. These expectations were captured from
+    the live API by sending Markdown and echoing the blocks it produced.
+    """
+
+    def test_unstyled_prose_is_a_bare_string(self):
+        self.assertEqual(notify_cli.compile_inline("just words"), "just words")
+
+    def test_a_lone_run_is_the_entity_itself_not_a_list(self):
+        self.assertEqual(
+            notify_cli.compile_inline("**bold**"),
+            {"type": "bold", "text": "bold"},
+        )
+
+    def test_mixed_content_becomes_a_segment_list(self):
+        self.assertEqual(
+            notify_cli.compile_inline("a **b** and `c`"),
+            ["a ", {"type": "bold", "text": "b"}, " and ",
+             {"type": "code", "text": "c"}],
+        )
+
+    def test_bold_wins_over_italic_so_asterisks_do_not_split(self):
+        self.assertEqual(
+            notify_cli.compile_inline("**two**"), {"type": "bold", "text": "two"}
+        )
+
+    def test_links_and_bare_urls_both_become_url_entities(self):
+        self.assertEqual(
+            notify_cli.compile_inline("[t](https://e.com)"),
+            {"type": "url", "text": "t", "url": "https://e.com"},
+        )
+        self.assertEqual(
+            notify_cli.compile_inline("see example.com/x now"),
+            ["see ", {"type": "url", "text": "example.com/x",
+                      "url": "example.com/x"}, " now"],
+        )
+
+    def test_version_numbers_are_not_mistaken_for_hosts(self):
+        self.assertEqual(notify_cli.compile_inline("matplotlib 3.10.8"),
+                         "matplotlib 3.10.8")
+
+    def test_heading_carries_its_level(self):
+        self.assertEqual(
+            notify_cli.compile_markdown_blocks("## Title"),
+            [{"type": "heading", "text": "Title", "size": 2}],
+        )
+
+    def test_bullet_and_ordered_lists(self):
+        self.assertEqual(
+            notify_cli.compile_markdown_blocks("- one\n- two"),
+            [{"type": "list", "items": [
+                {"label": "\u2022", "blocks": [{"type": "paragraph", "text": "one"}]},
+                {"label": "\u2022", "blocks": [{"type": "paragraph", "text": "two"}]}]}],
+        )
+        ordered = notify_cli.compile_markdown_blocks("1. first")[0]
+        self.assertEqual(ordered["items"][0]["type"], "1")
+        self.assertEqual(ordered["items"][0]["value"], 1)
+
+    def test_table_marks_its_header_row(self):
+        blocks = notify_cli.compile_markdown_blocks("| a | b |\n|---|---|\n| 1 | 2 |")
+        self.assertEqual(blocks[0]["type"], "table")
+        self.assertTrue(blocks[0]["cells"][0][0]["is_header"])
+        self.assertNotIn("is_header", blocks[0]["cells"][1][0])
+        self.assertEqual(blocks[0]["cells"][1][1]["text"], "2")
+
+    def test_quote_code_and_divider(self):
+        blocks = notify_cli.compile_markdown_blocks("> q\n\n```py\nx = 1\n```\n\n---")
+        self.assertEqual([b["type"] for b in blocks],
+                         ["blockquote", "pre", "divider"])
+        self.assertEqual(blocks[1], {"type": "pre", "text": "x = 1", "language": "py"})
+
+    def test_images_land_in_place_and_a_run_of_them_collages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            one = Path(tmp) / "a.png"
+            two = Path(tmp) / "b.png"
+            one.write_bytes(b"x")
+            two.write_bytes(b"y")
+            article = f"Intro\n\n![cap]({one})\n\nMiddle\n\n![]({one})\n![]({two})\n"
+            blocks, uploads = notify_cli.split_markdown_into_rich_blocks(article)
+            self.assertEqual([b["type"] for b in blocks],
+                             ["paragraph", "photo", "paragraph", "collage"])
+            self.assertEqual(blocks[1]["caption"], {"text": "cap"})
+            self.assertEqual(len(blocks[3]["blocks"]), 2)
+            self.assertEqual(len(uploads), 3)
+
+    def test_empty_block_guard_catches_a_silently_dropped_text(self):
+        # The failure this guard exists for: text under an unrecognised key.
+        self.assertEqual(notify_cli.count_empty_blocks(
+            [{"type": "paragraph", "text": ""}, {"type": "divider"}]), 1)
+        self.assertEqual(notify_cli.count_empty_blocks(
+            [{"type": "paragraph", "text": "ok"},
+             {"type": "photo", "photo": {}},
+             {"type": "list", "items": [
+                 {"label": "\u2022",
+                  "blocks": [{"type": "paragraph", "text": "x"}]}]}]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
