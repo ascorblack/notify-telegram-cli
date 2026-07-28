@@ -1359,7 +1359,8 @@ def send_text_body(
                 f"accepted; compare the echoed blocks against the schema.")
         return {"method": method, "chunks_sent": 1, "degraded_to_plain": False,
                 "blocks": len(sent), "blocks_stored": len(stored or []),
-                "images": len(uploads)}
+                "images": len(uploads),
+                "message_id": (payload.get("result") or {}).get("message_id")}
 
     chunks = chunk_text_message(text, max_length=message_limit_for_mode(mode))
     method = text_send_method_for_mode(mode)
